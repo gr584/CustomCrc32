@@ -1,5 +1,8 @@
 using System.Buffers.Binary;
 using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
+using System.Runtime.Intrinsics;
+using System.Runtime.Intrinsics.X86;
 
 namespace CustomCrc32;
 
@@ -40,6 +43,27 @@ public sealed class Crc32
 
     private readonly uint _xorOut;
 
+    /// <summary>Words in one 128-bit fold block.</summary>
+    private const int WordsPerBlock = 4;
+
+    /// <summary>
+    /// Shortest input worth folding. A single block gains nothing, because reducing the
+    /// accumulator costs the same four word-folds the table path would have done anyway;
+    /// from two blocks up, folding wins and keeps widening. Measured crossover, not a guess.
+    /// </summary>
+    private const int FoldingThreshold = 2 * WordsPerBlock;
+
+    /// <summary>True when this machine has the carry-less multiply and shuffle instructions.</summary>
+    private readonly bool _canFold;
+
+    /// <summary>Constants for folding one block, and four blocks, ahead.</summary>
+    private readonly Vector128<ulong> _foldByOneBlock;
+    private readonly Vector128<ulong> _foldByFourBlocks;
+
+    /// <summary>Byte permutations putting a loaded block into the engine's working order.</summary>
+    private readonly Vector128<byte> _bigEndianShuffle;
+    private readonly Vector128<byte> _littleEndianShuffle;
+
     /// <summary>Creates a CRC for the given parameter set, deriving its lookup table.</summary>
     public Crc32(Crc32Parameters parameters)
     {
@@ -52,6 +76,15 @@ public sealed class Crc32
         // A reflected CRC runs with the register held bit-reversed, so the starting value
         // has to be carried into that domain too.
         InitialRegister = parameters.ReflectInput ? Reverse(parameters.InitialValue) : parameters.InitialValue;
+
+        _canFold = Pclmulqdq.IsSupported && Ssse3.IsSupported;
+        if (_canFold)
+        {
+            _foldByOneBlock = FoldConstants(128, parameters.Polynomial, parameters.ReflectInput);
+            _foldByFourBlocks = FoldConstants(512, parameters.Polynomial, parameters.ReflectInput);
+            _bigEndianShuffle = BlockShuffle(parameters.ReflectInput, bigEndian: true);
+            _littleEndianShuffle = BlockShuffle(parameters.ReflectInput, bigEndian: false);
+        }
     }
 
     /// <summary>The parameter set this instance implements.</summary>
@@ -129,6 +162,13 @@ public sealed class Crc32
     /// <returns>The updated register state, which is not yet a CRC.</returns>
     public uint Append(uint register, ReadOnlySpan<uint> data)
     {
+        if (_canFold && data.Length >= FoldingThreshold)
+        {
+            int folded = data.Length / WordsPerBlock * WordsPerBlock;
+            register = FoldBlocks(register, data[..folded], _bigEndianShuffle);
+            data = data[folded..];
+        }
+
         // The natural word fold consumes bytes in the direction the engine runs: most
         // significant first when forward, least significant first when reflected. So it is
         // the reflected engine that needs the swap to produce a big-endian reading.
@@ -159,6 +199,13 @@ public sealed class Crc32
     /// <returns>The updated register state, which is not yet a CRC.</returns>
     public uint AppendLittleEndian(uint register, ReadOnlySpan<uint> data)
     {
+        if (_canFold && data.Length >= FoldingThreshold)
+        {
+            int folded = data.Length / WordsPerBlock * WordsPerBlock;
+            register = FoldBlocks(register, data[..folded], _littleEndianShuffle);
+            data = data[folded..];
+        }
+
         if (_reflectInput)
         {
             foreach (uint word in data)
@@ -216,6 +263,142 @@ public sealed class Crc32
 
         return register;
     }
+
+    /// <summary>
+    /// Folds whole 128-bit blocks with carry-less multiplication, returning the register
+    /// state they leave behind. <paramref name="data"/> must be a whole number of blocks.
+    /// </summary>
+    /// <remarks>
+    /// The accumulator is kept congruent to the message modulo the polynomial rather than
+    /// reduced at every step: folding a block ahead means multiplying by x¹²⁸ and replacing
+    /// that power with its residue, which is what the precomputed constants hold. Four
+    /// independent accumulators run at once so the multiply's latency overlaps rather than
+    /// stalling a single chain.
+    /// </remarks>
+    private uint FoldBlocks(uint register, ReadOnlySpan<uint> data, Vector128<byte> shuffle)
+    {
+        ref uint source = ref MemoryMarshal.GetReference(data);
+        int blocks = data.Length / WordsPerBlock;
+
+        // The incoming register enters where the engine keeps it: at the bottom of the
+        // accumulator when reflected, at the top when forward.
+        Vector128<ulong> seed = _reflectInput
+            ? Vector128.Create((ulong)register, 0UL)
+            : Vector128.Create(0UL, (ulong)register << 32);
+
+        Vector128<ulong> accumulator = LoadBlock(ref source, 0, shuffle) ^ seed;
+        int next = 1;
+
+        if (blocks >= 4)
+        {
+            Vector128<ulong> second = LoadBlock(ref source, 1, shuffle);
+            Vector128<ulong> third = LoadBlock(ref source, 2, shuffle);
+            Vector128<ulong> fourth = LoadBlock(ref source, 3, shuffle);
+
+            for (next = 4; next + 3 < blocks; next += 4)
+            {
+                accumulator = FoldBlock(accumulator, _foldByFourBlocks, LoadBlock(ref source, next, shuffle));
+                second = FoldBlock(second, _foldByFourBlocks, LoadBlock(ref source, next + 1, shuffle));
+                third = FoldBlock(third, _foldByFourBlocks, LoadBlock(ref source, next + 2, shuffle));
+                fourth = FoldBlock(fourth, _foldByFourBlocks, LoadBlock(ref source, next + 3, shuffle));
+            }
+
+            accumulator = FoldBlock(accumulator, _foldByOneBlock, second);
+            accumulator = FoldBlock(accumulator, _foldByOneBlock, third);
+            accumulator = FoldBlock(accumulator, _foldByOneBlock, fourth);
+        }
+
+        for (; next < blocks; next++)
+        {
+            accumulator = FoldBlock(accumulator, _foldByOneBlock, LoadBlock(ref source, next, shuffle));
+        }
+
+        return ReduceAccumulator(accumulator);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static Vector128<ulong> LoadBlock(ref uint source, int block, Vector128<byte> shuffle) =>
+        Ssse3.Shuffle(
+            Vector128.LoadUnsafe(ref source, (nuint)(block * WordsPerBlock)).AsByte(),
+            shuffle).AsUInt64();
+
+    /// <summary>
+    /// Multiplies the accumulator's halves by the two fold constants and adds the next
+    /// block, leaving a value still congruent to the message modulo the polynomial.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static Vector128<ulong> FoldBlock(Vector128<ulong> accumulator, Vector128<ulong> constants, Vector128<ulong> next) =>
+        Pclmulqdq.CarrylessMultiply(accumulator, constants, 0x00)
+        ^ Pclmulqdq.CarrylessMultiply(accumulator, constants, 0x11)
+        ^ next;
+
+    /// <summary>
+    /// Collapses the 128-bit accumulator back to a 32-bit register. Since the accumulator is
+    /// congruent to the message, running its four words through the table from a zero
+    /// register produces exactly the register the table path would have reached.
+    /// </summary>
+    private uint ReduceAccumulator(Vector128<ulong> accumulator)
+    {
+        Vector128<uint> words = accumulator.AsUInt32();
+        uint register = 0;
+
+        if (_reflectInput)
+        {
+            // Reflected: the message runs from the least significant word upwards.
+            register = FoldReflected(register, words[0]);
+            register = FoldReflected(register, words[1]);
+            register = FoldReflected(register, words[2]);
+            register = FoldReflected(register, words[3]);
+        }
+        else
+        {
+            register = FoldForward(register, words[3]);
+            register = FoldForward(register, words[2]);
+            register = FoldForward(register, words[1]);
+            register = FoldForward(register, words[0]);
+        }
+
+        return register;
+    }
+
+    /// <summary>
+    /// Constants for folding <paramref name="bitsAhead"/> bits ahead: the residues of the
+    /// powers of x that the fold skips over. A reflected engine keeps its register at the
+    /// bottom of the word, which shifts both exponents by 32 and calls for the reversed form.
+    /// </summary>
+    private static Vector128<ulong> FoldConstants(int bitsAhead, uint polynomial, bool reflected) => reflected
+        ? Vector128.Create(
+            (ulong)Reverse(PowerOfX(bitsAhead + 32, polynomial)) << 1,
+            (ulong)Reverse(PowerOfX(bitsAhead - 32, polynomial)) << 1)
+        : Vector128.Create(
+            (ulong)PowerOfX(bitsAhead, polynomial),
+            PowerOfX(bitsAhead + 64, polynomial));
+
+    /// <summary>Computes x^<paramref name="exponent"/> modulo the polynomial.</summary>
+    private static uint PowerOfX(int exponent, uint polynomial)
+    {
+        uint value = 1;
+
+        for (int i = 0; i < exponent; i++)
+        {
+            value = (value & 0x80000000) != 0 ? (value << 1) ^ polynomial : value << 1;
+        }
+
+        return value;
+    }
+
+    /// <summary>
+    /// The byte permutation that puts a block loaded from memory into the order the engine
+    /// works in: most significant message byte at the top for a forward engine, at the bottom
+    /// for a reflected one. Reflected plus little-endian needs no movement at all.
+    /// </summary>
+    private static Vector128<byte> BlockShuffle(bool reflected, bool bigEndian) => (reflected, bigEndian) switch
+    {
+        (false, true) => Vector128.Create((byte)12, 13, 14, 15, 8, 9, 10, 11, 4, 5, 6, 7, 0, 1, 2, 3),
+        (false, false) => Vector128.Create((byte)15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0),
+        (true, false) => Vector128.Create((byte)0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15),
+        (true, true) => Vector128.Create((byte)3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12),
+    };
 
     private static uint[] BuildTable(uint polynomial, bool reflected)
     {

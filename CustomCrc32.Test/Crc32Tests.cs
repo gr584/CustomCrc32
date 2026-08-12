@@ -119,6 +119,81 @@ public class Crc32Tests
             Is.EqualTo(preset.Instance.ComputeLittleEndian(data)));
     }
 
+    // --------------------------------------------------------- accelerated path
+
+    /// <summary>
+    /// Lengths straddling every boundary the folding path has: the threshold below which it
+    /// declines to engage, the four-block unrolled loop, its remainder, and the tail of words
+    /// that do not fill a block.
+    /// </summary>
+    private static readonly int[] FoldingBoundaryLengths =
+        [15, 16, 17, 18, 19, 20, 23, 24, 27, 28, 31, 32, 33, 35, 36, 39, 40, 47, 48, 63, 64, 65, 127, 128, 129, 255, 256, 257, 1000, 1023];
+
+    [TestCaseSource(nameof(Presets))]
+    public void Preset_LengthsAroundFoldingBoundaries_MatchReferenceModel(Preset preset)
+    {
+        Random random = new(777);
+
+        foreach (int length in FoldingBoundaryLengths)
+        {
+            uint[] data = RandomWords(random, length);
+
+            Assert.That(
+                preset.Instance.Compute(data),
+                Is.EqualTo(ReferenceModel(preset.Parameters, ToBigEndianBytes(data))),
+                $"{preset.Name}, big-endian, length {length}");
+
+            Assert.That(
+                preset.Instance.ComputeLittleEndian(data),
+                Is.EqualTo(ReferenceModel(preset.Parameters, ToLittleEndianBytes(data))),
+                $"{preset.Name}, little-endian, length {length}");
+        }
+    }
+
+    /// <summary>
+    /// Pits the two implementations against each other directly. Appending one word at a
+    /// time keeps every call under the folding threshold, forcing the table path, whereas the
+    /// single-shot call over the same data folds. They must agree.
+    /// </summary>
+    [TestCaseSource(nameof(Presets))]
+    public void Preset_FoldedResult_MatchesWordAtATimeAppend(Preset preset)
+    {
+        uint[] data = RandomWords(new Random(2024), 257);
+
+        uint bigEndian = preset.Instance.InitialRegister;
+        uint littleEndian = preset.Instance.InitialRegister;
+        foreach (uint word in data)
+        {
+            bigEndian = preset.Instance.Append(bigEndian, [word]);
+            littleEndian = preset.Instance.AppendLittleEndian(littleEndian, [word]);
+        }
+
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(preset.Instance.Finish(bigEndian), Is.EqualTo(preset.Instance.Compute(data)));
+            Assert.That(preset.Instance.Finish(littleEndian), Is.EqualTo(preset.Instance.ComputeLittleEndian(data)));
+        }
+    }
+
+    /// <summary>
+    /// Folding must not depend on where the caller chooses to split the stream, which it
+    /// would if the accumulator carried state the register cannot express.
+    /// </summary>
+    [TestCaseSource(nameof(Presets))]
+    public void Preset_ArbitrarySplitPoints_ProduceTheSameResult(Preset preset)
+    {
+        uint[] data = RandomWords(new Random(90210), 300);
+        uint expected = preset.Instance.Compute(data);
+
+        for (int split = 0; split <= data.Length; split += 7)
+        {
+            uint register = preset.Instance.Append(preset.Instance.InitialRegister, data[..split]);
+            register = preset.Instance.Append(register, data[split..]);
+
+            Assert.That(preset.Instance.Finish(register), Is.EqualTo(expected), $"{preset.Name}, split at {split}");
+        }
+    }
+
     // ------------------------------------------------------- arbitrary parameters
 
     /// <summary>
@@ -141,7 +216,9 @@ public class Crc32Tests
                 XorOut: RandomWord(random));
 
             Crc32 crc32 = new(parameters);
-            uint[] data = RandomWords(random, random.Next(0, 20));
+            // Spans both sides of the folding threshold, so random parameters exercise the
+            // accelerated path too and not only the table.
+            uint[] data = RandomWords(random, random.Next(0, 140));
             string context = $"{parameters} over [{string.Join(", ", data.Select(w => $"0x{w:X8}"))}]";
 
             Assert.That(

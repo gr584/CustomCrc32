@@ -4,6 +4,9 @@ A configurable 32-bit CRC for input arriving as **32-bit words** rather than byt
 parameter set expressible in the Rocksoft/Williams model works, including reflected variants,
 and twelve catalogued CRC-32s ship as named presets.
 
+Runs at **~21 GB/s** on x86-64 with carry-less multiply, for every parameter set rather than
+a privileged few, falling back to a table where the instructions are unavailable.
+
 ```csharp
 using CustomCrc32;
 
@@ -17,6 +20,9 @@ uint zlib = Crc32.IsoHdlc.Compute(words);   // the usual "CRC-32"
 
 - .NET 8.0 SDK or newer. All three projects target `net8.0`; built and tested with SDK 10.0.303.
 - No runtime package dependencies — the library is plain BCL code.
+- Hardware acceleration engages automatically where `PCLMULQDQ` and `SSSE3` are available,
+  which on x86-64 means anything from Westmere (2010) onwards. Elsewhere — including ARM —
+  the table path runs instead and returns identical answers.
 
 ## Presets
 
@@ -152,6 +158,50 @@ calls like `Compute([])` ambiguous.
 
 ## Implementation notes
 
+There are two layers: a carry-less-multiply fold that does the bulk of the work where the
+hardware allows, and a table that handles short inputs, the tail, and machines without the
+instructions. Both are driven by the same parameter set and produce identical answers — a
+test appends one word at a time, keeping every call under the folding threshold, and requires
+the result to match the single-shot folded call.
+
+### Carry-less multiply folding
+
+Where `PCLMULQDQ` and `SSSE3` are present, whole 128-bit blocks are folded with
+`Pclmulqdq.CarrylessMultiply`. Rather than reduce modulo the polynomial at every step, the
+accumulator is kept merely *congruent* to the message: folding a block ahead means
+multiplying by x¹²⁸ and substituting that power's residue, which is what the precomputed
+constants hold.
+
+```
+accumulator = clmul(accumulator.lo, K.lo) ^ clmul(accumulator.hi, K.hi) ^ next_block
+```
+
+The constants are derived from the polynomial at construction, so this works for arbitrary
+parameters and not merely the presets. For folding *n* bits ahead:
+
+- **Forward**: `K.lo = xⁿ mod P`, `K.hi = xⁿ⁺⁶⁴ mod P`.
+- **Reflected**: `K.lo = reverse(xⁿ⁺³² mod P) << 1`, `K.hi = reverse(xⁿ⁻³² mod P) << 1`. The
+  ±32 offset is the reflected register living at the bottom of the word rather than the top;
+  the `<< 1` is the bit-reversal of a product landing one place over.
+
+Four independent accumulators run at once, so the multiply's latency overlaps instead of
+stalling a single chain, and they are combined with single-block constants at the end.
+
+Loading a block needs at most one `pshufb`, and which permutation depends on both the engine
+and the requested byte order — reflected plus little-endian is already in the right order and
+moves nothing.
+
+Finishing is where the two layers meet. Because the accumulator is congruent to the message,
+running its four words through the *table* from a zero register lands on exactly the register
+the table path would have reached, after which any leftover words are appended normally. That
+keeps the reduction short and, more usefully, means there is only one definition of what the
+register means.
+
+A sanity check on the derivation: for polynomial `0x04C11DB7` reflected, it produces
+`0x1751997d0` and `0xccaa009e` — the constants published for zlib.
+
+### The table
+
 Each instance derives a 256-entry table mapping a byte to the register state produced by
 clocking it through eight rounds, so a whole byte folds in with one lookup.
 
@@ -209,7 +259,7 @@ polynomials, initial values and final XORs before the implementation was written
 
 ## Correctness
 
-The test suite ([`CustomCrc32.Test`](CustomCrc32.Test/Crc32Tests.cs), NUnit, 119 tests) is
+The test suite ([`CustomCrc32.Test`](CustomCrc32.Test/Crc32Tests.cs), NUnit, 155 tests) is
 built on a single oracle: **Williams' model spelled out literally** — feed each byte in at
 the top of the register, clock it one bit at a time, reflect on the way in and out where
 asked. It is deliberately naive and structurally unlike the table-driven implementation, and
@@ -224,9 +274,17 @@ twelve times over is not a thing that happens.
 Everything else is then checked against the oracle:
 
 - Every preset, both byte orders, over inputs of length 0–40 words.
-- **Arbitrary parameters** — 400 random parameter sets, both byte orders. This is the load-
-  bearing test: the presets all have `RefIn == RefOut` and a bit-reversal-palindrome initial
-  value, so only random parameters exercise mismatched reflection and asymmetric inits.
+- **Arbitrary parameters** — 400 random parameter sets, both byte orders, at lengths spanning
+  both sides of the folding threshold. This is the load-bearing test: the presets all have
+  `RefIn == RefOut` and a bit-reversal-palindrome initial value, so only random parameters
+  exercise mismatched reflection and asymmetric inits.
+- **The two layers against each other** — appending one word at a time keeps every call below
+  the folding threshold and so forces the table, while the single-shot call over the same data
+  folds; they must agree.
+- **Folding boundaries** — thirty lengths straddling the engagement threshold, the four-block
+  unrolled loop, its remainder, and the sub-block tail.
+- **Split invariance** — the same input broken at every seventh word must give the same answer
+  as one pass, which it would not if the accumulator carried state the register cannot express.
 - Streaming: chunked `Append`/`AppendLittleEndian` then `Finish` must equal the one-shot
   result, for every preset, including a zero-length chunk.
 - `InitialRegister` is the reversed initial value when reflected and unchanged when not,
@@ -237,12 +295,21 @@ Everything else is then checked against the oracle:
 - The fifteen MPEG-2 values this library produced before `Crc32Parameters` existed still
   hold, so the migration is known not to have moved any answers.
 
+Mutation checks confirm the suite is not vacuous. Dropping the `<< 1` from the reflected fold
+constant fails 50 tests; shifting the forward constant's exponent by one fails 36; flipping a
+bit of the polynomial fails 7. Removing the initial-value reversal fails exactly the two tests
+written for that gap, since — every preset having a palindromic initial value — nothing else
+can catch it.
+
 ## Benchmarks
 
-[`CustomCrc32.Benchmarks`](CustomCrc32.Benchmarks/) compares both engines against the
-bit-at-a-time formulation, across input sizes chosen to sit at different levels of the memory
-hierarchy. `GlobalSetup` throws if any two paths that should agree have diverged — a speed
-comparison stops meaning anything once the baseline is wrong.
+[`CustomCrc32.Benchmarks`](CustomCrc32.Benchmarks/) compares the shipping implementation
+against the two formulations it replaced — one bit at a time, and one table lookup per byte —
+across input sizes chosen to sit at different levels of the memory hierarchy. The table
+baselines are reimplemented inside the benchmark rather than called through the library,
+since the library now folds automatically and there is no supported way to ask it not to.
+`GlobalSetup` throws if any two paths that should agree have diverged — a speed comparison
+stops meaning anything once the baseline is wrong.
 
 `ThroughputColumn` is a custom `IColumn` adding a GB/s column derived from the mean and the
 `WordCount` parameter. BenchmarkDotNet has no built-in throughput column, and
@@ -261,51 +328,58 @@ X64 RyuJIT x86-64-v3, BenchmarkDotNet 0.15.8. **Taken with `--job short`** (3 wa
 iterations) — good enough for the headline ratios, but re-run with the default job before
 quoting these anywhere.
 
-| WordCount        | Bitwise   | Forward BE | Forward LE | Reflected BE | Reflected LE |
-| ---------------- | --------- | ---------- | ---------- | ------------ | ------------ |
-| 16 (64 B)        | 114 MB/s  | 633 MB/s   | 640 MB/s   | 771 MB/s     | 751 MB/s     |
-| 256 (1 KiB)      | 38 MB/s   | 569 MB/s   | 574 MB/s   | 657 MB/s     | 644 MB/s     |
-| 4,096 (16 KiB)   | 34 MB/s   | 566 MB/s   | 573 MB/s   | 653 MB/s     | 642 MB/s     |
-| 65,536 (256 KiB) | 34 MB/s   | 565 MB/s   | 566 MB/s   | 649 MB/s     | 650 MB/s     |
-| 262,144 (1 MiB)  | 34 MB/s   | 556 MB/s   | 560 MB/s   | 634 MB/s     | 636 MB/s     |
+Throughput, higher is better. *Table* is the previous implementation, kept here as the
+baseline the fold replaced:
 
-Three things worth reading off this table:
+| WordCount        | Bitwise  | Table fwd | Table refl | Fold fwd BE | Fold fwd LE | Fold refl BE | Fold refl LE |
+| ---------------- | -------- | --------- | ---------- | ----------- | ----------- | ------------ | ------------ |
+| 16 (64 B)        | 111 MB/s | 663 MB/s  | 766 MB/s   | 2.46 GB/s   | 2.52 GB/s   | 2.55 GB/s    | 2.81 GB/s    |
+| 256 (1 KiB)      | 38 MB/s  | 570 MB/s  | 642 MB/s   | 14.5 GB/s   | 14.3 GB/s   | 15.0 GB/s    | 15.1 GB/s    |
+| 4,096 (16 KiB)   | 34 MB/s  | 566 MB/s  | 623 MB/s   | 21.1 GB/s   | 21.4 GB/s   | 21.6 GB/s    | 21.9 GB/s    |
+| 65,536 (256 KiB) | 34 MB/s  | 559 MB/s  | 634 MB/s   | 21.0 GB/s   | 22.0 GB/s   | 22.2 GB/s    | 22.1 GB/s    |
+| 262,144 (1 MiB)  | 34 MB/s  | 567 MB/s  | 636 MB/s   | 21.3 GB/s   | 21.5 GB/s   | 21.5 GB/s    | 21.5 GB/s    |
 
-**The byte swap is free.** BE and LE sit within run-to-run noise of each other in both
-engines at every size. The `bswap` acts on the incoming word, not on the CRC register, so it
-has no dependency on the previous iteration and overlaps with the four serially-dependent
-table lookups that set the pace.
+**Folding is ~38× the table** at steady state and ~620× the bitwise loop. It reaches roughly
+5.7 bytes per cycle, which for a 4 KiB working set is bounded by carry-less multiply
+throughput rather than memory.
 
-**The reflected engine is about 15% faster**, consistently. Its index is `r & 0xFF`, a
-low-byte extract, where the forward engine needs `r >> 24`, a real shift. That sits directly
-on the load-address dependency chain, which is what paces the loop, so the difference shows
-up as throughput. If you have a free choice of parameter set and care about speed, prefer a
-reflected one.
+**Small inputs still gain.** At 64 bytes — the smallest size measured, and only two blocks
+above the engagement threshold — folding is around 4× the table. Below the threshold the
+table runs instead, and the crossover was measured rather than assumed: at one block the two
+are level, at two blocks folding is 1.9× ahead.
 
-**Throughput is flat across sizes.** The 1 KiB table fits in L1 and the input streams past,
-so the work is compute-bound rather than memory-bound. The smallest row is dominated by
-per-call overhead, which is why bitwise looks relatively better there.
+**The forward/reflected gap has closed.** With the table it was a consistent 15%, because the
+forward engine's `r >> 24` index sat on the load-address dependency chain where the reflected
+engine's `r & 0xFF` did not. Folding does not care: both are ~21.5 GB/s, and the table now
+only reduces the accumulator and mops up the tail.
 
-Moving the table from a `static readonly` field to a per-instance field, which the parameter
-migration required, cost nothing measurable: forward throughput was 552–564 MB/s before and
-556–573 MB/s after.
+**The byte swap is still free**, in both engines and at every size. It is now a `pshufb` on
+the loaded block rather than a `bswap` on a word, but the reasoning is unchanged — it does
+not sit on the accumulator's dependency chain.
 
-~560 MB/s is about the expected ceiling for one-lookup-per-byte. **Slicing-by-8** — consuming
-eight bytes per round from a larger table — typically reaches 2–3 GB/s and would be the next
-step if throughput matters.
+### Going further
 
-Hardware CRC instructions are not a drop-in, for a subtler reason than the polynomial: they
-all compute **reflected** CRCs. `Sse42.Crc32` on x86 is Castagnoli-only. ARM's
-`System.Runtime.Intrinsics.Arm.Crc32` does implement `0x04C11DB7`, but reflected. They would
-serve `Crc32.Castagnoli` and `Crc32.IsoHdlc` well and nothing else; a general
-`Crc32Parameters` engine cannot dispatch to them in the general case.
+Nothing here is the ceiling.
+
+**VPCLMULQDQ** folds 256 or 512 bits per instruction instead of 128 and would multiply this
+again, but it needs Ice Lake or newer, and .NET 8 does not expose `Pclmulqdq.V256` at all —
+that arrived later. This machine is Coffee Lake, so it was not an option to measure.
+
+**`Sse42.Crc32`** is worth a mention and a warning. It is a single instruction computing a
+CRC directly, but it is hardwired to the Castagnoli polynomial, so it could accelerate
+`Crc32.Castagnoli` and nothing else. Given folding already reaches ~21 GB/s for *every*
+parameter set, a special case for one preset did not seem worth the branch.
+
+The `pshufb` on each load could be skipped in the reflected little-endian case, where the
+permutation is the identity. On this microarchitecture shuffles and carry-less multiplies
+compete for the same port, so it may be worth a little; it was left in for simplicity.
 
 ## Project layout
 
 ```
 CustomCrc32.slnx                  Solution (new-style XML format)
 ├── CustomCrc32/                  Class library — the implementation
-│   ├── Crc32.cs                  Engines, presets, streaming API
+│   ├── Crc32.cs                  Engines, folding, presets, streaming API
 │   └── Crc32Parameters.cs        Parameter model and preset values
 ├── CustomCrc32.Test/             NUnit test suite
 │   └── Crc32Tests.cs

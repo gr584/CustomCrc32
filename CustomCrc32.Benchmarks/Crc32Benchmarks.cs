@@ -4,8 +4,10 @@ using BenchmarkDotNet.Attributes;
 namespace CustomCrc32.Benchmarks;
 
 /// <summary>
-/// Measures the table-driven engines against the bit-at-a-time formulation of the same CRC,
-/// across input sizes chosen to sit at different levels of the memory hierarchy.
+/// Measures the shipping implementation against the two formulations it replaced: one bit at
+/// a time, and one table lookup per byte. The table baselines are reimplemented here rather
+/// than called through the library, because the library now folds automatically and there is
+/// no supported way to ask it not to.
 /// </summary>
 public class Crc32Benchmarks
 {
@@ -18,13 +20,12 @@ public class Crc32Benchmarks
     public int WordCount { get; set; }
 
     private uint[] _data = [];
+    private uint[] _forwardTable = [];
+    private uint[] _reflectedTable = [];
 
     [GlobalSetup]
     public void Setup()
     {
-        // Fixed seed so every run measures the same bytes. The data is random because a
-        // CRC's cost is data-independent but its table lookups are not obviously so, and
-        // degenerate input (all zeroes) would keep one table entry permanently hot.
         Random random = new(20250811);
 
         _data = new uint[WordCount];
@@ -33,14 +34,18 @@ public class Crc32Benchmarks
             _data[i] = (uint)random.NextInt64(uint.MinValue, (long)uint.MaxValue + 1);
         }
 
-        // A speed comparison between implementations only means anything while they still
-        // agree on the answer, so refuse to report numbers if they have diverged.
-        Verify("forward table vs bitwise", Forward(), Bitwise());
+        _forwardTable = BuildTable(Crc32Parameters.Mpeg2.Polynomial, reflected: false);
+        _reflectedTable = BuildTable(Crc32Parameters.IsoHdlc.Polynomial, reflected: true);
+
+        // A speed comparison only means anything while the implementations still agree.
+        Verify("forward table vs folded", TableForward(), FoldedForward());
+        Verify("reflected table vs folded", TableReflected(), FoldedReflectedLittleEndian());
+        Verify("forward bitwise vs folded", Bitwise(), FoldedForward());
 
         uint[] swapped = new uint[_data.Length];
         BinaryPrimitives.ReverseEndianness(_data, swapped);
-        Verify("little-endian identity", ForwardLittleEndian(), Crc32.Mpeg2.Compute(swapped));
-        Verify("reflected little-endian identity", ReflectedLittleEndian(), Crc32.IsoHdlc.Compute(swapped));
+        Verify("forward byte-order identity", FoldedForwardLittleEndian(), Crc32.Mpeg2.Compute(swapped));
+        Verify("reflected byte-order identity", FoldedReflectedLittleEndian(), Crc32.IsoHdlc.Compute(swapped));
     }
 
     private void Verify(string what, uint actual, uint expected)
@@ -52,10 +57,32 @@ public class Crc32Benchmarks
         }
     }
 
-    /// <summary>
-    /// The unoptimised formulation, clocking the register one bit at a time. It is the
-    /// baseline because it is what the table lookup replaces.
-    /// </summary>
+    private static uint[] BuildTable(uint polynomial, bool reflected)
+    {
+        uint[] table = new uint[256];
+        uint reversed = 0;
+        for (int i = 0; i < 32; i++)
+        {
+            reversed = (reversed << 1) | ((polynomial >> i) & 1);
+        }
+
+        for (uint index = 0; index < 256; index++)
+        {
+            uint entry = reflected ? index : index << 24;
+            for (int round = 0; round < 8; round++)
+            {
+                entry = reflected
+                    ? ((entry & 1) != 0 ? (entry >> 1) ^ reversed : entry >> 1)
+                    : ((entry & 0x80000000) != 0 ? (entry << 1) ^ polynomial : entry << 1);
+            }
+
+            table[index] = entry;
+        }
+
+        return table;
+    }
+
+    /// <summary>The unoptimised formulation, clocking the register one bit at a time.</summary>
     [Benchmark(Baseline = true, Description = "Bitwise")]
     public uint Bitwise()
     {
@@ -75,22 +102,51 @@ public class Crc32Benchmarks
         return crc ^ parameters.XorOut;
     }
 
-    /// <summary>The forward (non-reflected) engine: one table lookup per byte.</summary>
-    [Benchmark(Description = "Forward BE")]
-    public uint Forward() => Crc32.Mpeg2.Compute(_data);
+    /// <summary>One table lookup per byte, forward engine — what the library did before folding.</summary>
+    [Benchmark(Description = "Table forward")]
+    public uint TableForward()
+    {
+        uint crc = Crc32Parameters.Mpeg2.InitialValue;
 
-    /// <summary>The forward engine with the per-word byte swap.</summary>
-    [Benchmark(Description = "Forward LE")]
-    public uint ForwardLittleEndian() => Crc32.Mpeg2.ComputeLittleEndian(_data);
+        foreach (uint word in _data)
+        {
+            crc ^= word;
+            crc = (crc << 8) ^ _forwardTable[crc >> 24];
+            crc = (crc << 8) ^ _forwardTable[crc >> 24];
+            crc = (crc << 8) ^ _forwardTable[crc >> 24];
+            crc = (crc << 8) ^ _forwardTable[crc >> 24];
+        }
 
-    /// <summary>
-    /// The reflected engine, which clocks the register the other way. The natural fold
-    /// direction for a reflected CRC is little-endian, so this variant carries the byte swap.
-    /// </summary>
-    [Benchmark(Description = "Reflected BE")]
-    public uint Reflected() => Crc32.IsoHdlc.Compute(_data);
+        return crc ^ Crc32Parameters.Mpeg2.XorOut;
+    }
 
-    /// <summary>The reflected engine folding in its natural direction, with no swap.</summary>
-    [Benchmark(Description = "Reflected LE")]
-    public uint ReflectedLittleEndian() => Crc32.IsoHdlc.ComputeLittleEndian(_data);
+    /// <summary>One table lookup per byte, reflected engine.</summary>
+    [Benchmark(Description = "Table reflected")]
+    public uint TableReflected()
+    {
+        uint crc = Crc32Parameters.IsoHdlc.InitialValue;
+
+        foreach (uint word in _data)
+        {
+            crc ^= word;
+            crc = (crc >> 8) ^ _reflectedTable[crc & 0xFF];
+            crc = (crc >> 8) ^ _reflectedTable[crc & 0xFF];
+            crc = (crc >> 8) ^ _reflectedTable[crc & 0xFF];
+            crc = (crc >> 8) ^ _reflectedTable[crc & 0xFF];
+        }
+
+        return crc ^ Crc32Parameters.IsoHdlc.XorOut;
+    }
+
+    [Benchmark(Description = "Folded forward BE")]
+    public uint FoldedForward() => Crc32.Mpeg2.Compute(_data);
+
+    [Benchmark(Description = "Folded forward LE")]
+    public uint FoldedForwardLittleEndian() => Crc32.Mpeg2.ComputeLittleEndian(_data);
+
+    [Benchmark(Description = "Folded reflected BE")]
+    public uint FoldedReflected() => Crc32.IsoHdlc.Compute(_data);
+
+    [Benchmark(Description = "Folded reflected LE")]
+    public uint FoldedReflectedLittleEndian() => Crc32.IsoHdlc.ComputeLittleEndian(_data);
 }
