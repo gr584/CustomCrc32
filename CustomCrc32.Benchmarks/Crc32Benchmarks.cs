@@ -4,9 +4,8 @@ using BenchmarkDotNet.Attributes;
 namespace CustomCrc32.Benchmarks;
 
 /// <summary>
-/// Measures <see cref="Crc32.Compute(ReadOnlySpan{uint})"/> against the bit-at-a-time
-/// formulation of the same CRC, across input sizes chosen to sit at different levels of
-/// the memory hierarchy.
+/// Measures the table-driven engines against the bit-at-a-time formulation of the same CRC,
+/// across input sizes chosen to sit at different levels of the memory hierarchy.
 /// </summary>
 public class Crc32Benchmarks
 {
@@ -34,26 +33,22 @@ public class Crc32Benchmarks
             _data[i] = (uint)random.NextInt64(uint.MinValue, (long)uint.MaxValue + 1);
         }
 
-        // A speed comparison between two implementations only means anything while they
-        // still agree on the answer, so refuse to report numbers if they have diverged.
-        uint bitwise = Bitwise();
-        uint tableDriven = TableDriven();
-        if (bitwise != tableDriven)
-        {
-            throw new InvalidOperationException(
-                $"Implementations disagree at {WordCount} words: bitwise 0x{bitwise:X8}, table-driven 0x{tableDriven:X8}.");
-        }
+        // A speed comparison between implementations only means anything while they still
+        // agree on the answer, so refuse to report numbers if they have diverged.
+        Verify("forward table vs bitwise", Forward(), Bitwise());
 
-        // The little-endian path must agree with the big-endian one over swapped input.
         uint[] swapped = new uint[_data.Length];
         BinaryPrimitives.ReverseEndianness(_data, swapped);
+        Verify("little-endian identity", ForwardLittleEndian(), Crc32.Mpeg2.Compute(swapped));
+        Verify("reflected little-endian identity", ReflectedLittleEndian(), Crc32.IsoHdlc.Compute(swapped));
+    }
 
-        uint littleEndian = TableDrivenLittleEndian();
-        uint expected = Crc32.Compute(swapped);
-        if (littleEndian != expected)
+    private void Verify(string what, uint actual, uint expected)
+    {
+        if (actual != expected)
         {
             throw new InvalidOperationException(
-                $"Little-endian path disagrees at {WordCount} words: got 0x{littleEndian:X8}, expected 0x{expected:X8}.");
+                $"{what} disagrees at {WordCount} words: got 0x{actual:X8}, expected 0x{expected:X8}.");
         }
     }
 
@@ -64,7 +59,8 @@ public class Crc32Benchmarks
     [Benchmark(Baseline = true, Description = "Bitwise")]
     public uint Bitwise()
     {
-        uint crc = Crc32.InitialValue;
+        Crc32Parameters parameters = Crc32Parameters.Mpeg2;
+        uint crc = parameters.InitialValue;
 
         foreach (uint word in _data)
         {
@@ -72,21 +68,29 @@ public class Crc32Benchmarks
 
             for (int round = 0; round < 32; round++)
             {
-                crc = (crc & 0x80000000) != 0 ? (crc << 1) ^ Crc32.Polynomial : crc << 1;
+                crc = (crc & 0x80000000) != 0 ? (crc << 1) ^ parameters.Polynomial : crc << 1;
             }
         }
 
-        return crc ^ Crc32.XorOut;
+        return crc ^ parameters.XorOut;
     }
 
-    /// <summary>The shipping implementation: one table lookup per byte.</summary>
-    [Benchmark(Description = "Table-driven (BE)")]
-    public uint TableDriven() => Crc32.Compute(_data);
+    /// <summary>The forward (non-reflected) engine: one table lookup per byte.</summary>
+    [Benchmark(Description = "Forward BE")]
+    public uint Forward() => Crc32.Mpeg2.Compute(_data);
+
+    /// <summary>The forward engine with the per-word byte swap.</summary>
+    [Benchmark(Description = "Forward LE")]
+    public uint ForwardLittleEndian() => Crc32.Mpeg2.ComputeLittleEndian(_data);
 
     /// <summary>
-    /// The same, over the little-endian serialisation of the words. The difference against
-    /// <see cref="TableDriven"/> is the cost of the per-word byte swap.
+    /// The reflected engine, which clocks the register the other way. The natural fold
+    /// direction for a reflected CRC is little-endian, so this variant carries the byte swap.
     /// </summary>
-    [Benchmark(Description = "Table-driven (LE)")]
-    public uint TableDrivenLittleEndian() => Crc32.ComputeLittleEndian(_data);
+    [Benchmark(Description = "Reflected BE")]
+    public uint Reflected() => Crc32.IsoHdlc.Compute(_data);
+
+    /// <summary>The reflected engine folding in its natural direction, with no swap.</summary>
+    [Benchmark(Description = "Reflected LE")]
+    public uint ReflectedLittleEndian() => Crc32.IsoHdlc.ComputeLittleEndian(_data);
 }

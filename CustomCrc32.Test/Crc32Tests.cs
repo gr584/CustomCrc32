@@ -5,33 +5,192 @@ namespace CustomCrc32.Test;
 [TestFixture]
 public class Crc32Tests
 {
+    /// <summary>A preset, paired with the check value published for it in the CRC catalogue.</summary>
+    public sealed record Preset(string Name, Crc32 Instance, Crc32Parameters Parameters, uint CheckValue)
+    {
+        public override string ToString() => Name;
+    }
+
+    private static IEnumerable<Preset> Presets()
+    {
+        yield return new("IsoHdlc", Crc32.IsoHdlc, Crc32Parameters.IsoHdlc, 0xCBF43926);
+        yield return new("Mpeg2", Crc32.Mpeg2, Crc32Parameters.Mpeg2, 0x0376E6E7);
+        yield return new("Bzip2", Crc32.Bzip2, Crc32Parameters.Bzip2, 0xFC891918);
+        yield return new("Castagnoli", Crc32.Castagnoli, Crc32Parameters.Castagnoli, 0xE3069283);
+        yield return new("JamCrc", Crc32.JamCrc, Crc32Parameters.JamCrc, 0x340BC6D9);
+        yield return new("Cksum", Crc32.Cksum, Crc32Parameters.Cksum, 0x765E7680);
+        yield return new("Aixm", Crc32.Aixm, Crc32Parameters.Aixm, 0x3010BF7F);
+        yield return new("Autosar", Crc32.Autosar, Crc32Parameters.Autosar, 0x1697D06A);
+        yield return new("Base91D", Crc32.Base91D, Crc32Parameters.Base91D, 0x87315576);
+        yield return new("CdRomEdc", Crc32.CdRomEdc, Crc32Parameters.CdRomEdc, 0x6EC2EDC4);
+        yield return new("Mef", Crc32.Mef, Crc32Parameters.Mef, 0xD2C22F51);
+        yield return new("Xfer", Crc32.Xfer, Crc32Parameters.Xfer, 0xBD0BE338);
+    }
+
+    // ---------------------------------------------------------------- presets
+
     /// <summary>
-    /// The CRC of the ASCII bytes "123456789", the value catalogued for this parameter
-    /// set. It anchors <see cref="ReferenceBitwise"/> to a published constant, which in
-    /// turn lets the reference stand in as an oracle for the rest of the fixture.
+    /// Anchors the whole fixture. Each preset's parameters, run through the reference model,
+    /// must reproduce the check value published for that CRC. Passing means the preset
+    /// constants and the reference model are both right, since agreeing by accident on a
+    /// 32-bit value twelve times over is not a thing that happens.
     /// </summary>
-    private const uint PublishedCheckValue = 0x0376E6E7;
-
-    [Test]
-    public void ReferenceBitwise_OverCheckString_MatchesPublishedCheckValue()
+    [TestCaseSource(nameof(Presets))]
+    public void Preset_ReferenceModelOverCheckString_MatchesPublishedCheckValue(Preset preset)
     {
-        uint actual = ReferenceBitwise("123456789"u8);
+        uint actual = ReferenceModel(preset.Parameters, "123456789"u8);
 
-        Assert.That(actual, Is.EqualTo(PublishedCheckValue));
+        Assert.That(actual, Is.EqualTo(preset.CheckValue));
+    }
+
+    [TestCaseSource(nameof(Presets))]
+    public void Preset_Instance_ExposesMatchingParameters(Preset preset)
+    {
+        Assert.That(preset.Instance.Parameters, Is.EqualTo(preset.Parameters));
+    }
+
+    [TestCaseSource(nameof(Presets))]
+    public void Preset_Compute_MatchesReferenceModelOverBigEndianBytes(Preset preset)
+    {
+        Random random = new(20250811);
+
+        for (int length = 0; length <= 40; length++)
+        {
+            uint[] data = RandomWords(random, length);
+
+            Assert.That(
+                preset.Instance.Compute(data),
+                Is.EqualTo(ReferenceModel(preset.Parameters, ToBigEndianBytes(data))),
+                $"{preset.Name}, length {length}");
+        }
+    }
+
+    [TestCaseSource(nameof(Presets))]
+    public void Preset_ComputeLittleEndian_MatchesReferenceModelOverLittleEndianBytes(Preset preset)
+    {
+        Random random = new(20250811);
+
+        for (int length = 0; length <= 40; length++)
+        {
+            uint[] data = RandomWords(random, length);
+
+            Assert.That(
+                preset.Instance.ComputeLittleEndian(data),
+                Is.EqualTo(ReferenceModel(preset.Parameters, ToLittleEndianBytes(data))),
+                $"{preset.Name}, length {length}");
+        }
+    }
+
+    [TestCaseSource(nameof(Presets))]
+    public void Preset_EmptyInput_EqualsFinishOfInitialRegister(Preset preset)
+    {
+        Assert.That(
+            preset.Instance.Compute([]),
+            Is.EqualTo(preset.Instance.Finish(preset.Instance.InitialRegister)));
+    }
+
+    [TestCaseSource(nameof(Presets))]
+    public void Preset_AppendInChunksThenFinish_MatchesSinglePassCompute(Preset preset)
+    {
+        uint[] data = RandomWords(new Random(4242), 33);
+
+        uint register = preset.Instance.InitialRegister;
+        foreach (uint[] chunk in new[] { data[..7], data[7..7], data[7..20], data[20..] })
+        {
+            register = preset.Instance.Append(register, chunk);
+        }
+
+        Assert.That(preset.Instance.Finish(register), Is.EqualTo(preset.Instance.Compute(data)));
+    }
+
+    [TestCaseSource(nameof(Presets))]
+    public void Preset_AppendLittleEndianInChunksThenFinish_MatchesSinglePassCompute(Preset preset)
+    {
+        uint[] data = RandomWords(new Random(4242), 33);
+
+        uint register = preset.Instance.InitialRegister;
+        foreach (uint[] chunk in new[] { data[..11], data[11..29], data[29..] })
+        {
+            register = preset.Instance.AppendLittleEndian(register, chunk);
+        }
+
+        Assert.That(
+            preset.Instance.Finish(register),
+            Is.EqualTo(preset.Instance.ComputeLittleEndian(data)));
+    }
+
+    // ------------------------------------------------------- arbitrary parameters
+
+    /// <summary>
+    /// The presets only exercise parameter sets where input and output reflection agree, and
+    /// where the initial value is a bit-reversal palindrome. Random parameters cover the rest,
+    /// in particular mismatched reflection and asymmetric initial values.
+    /// </summary>
+    [Test]
+    public void ArbitraryParameters_MatchReferenceModel()
+    {
+        Random random = new(19700101);
+
+        for (int trial = 0; trial < 400; trial++)
+        {
+            Crc32Parameters parameters = new(
+                Polynomial: RandomWord(random),
+                InitialValue: RandomWord(random),
+                ReflectInput: random.Next(2) == 0,
+                ReflectOutput: random.Next(2) == 0,
+                XorOut: RandomWord(random));
+
+            Crc32 crc32 = new(parameters);
+            uint[] data = RandomWords(random, random.Next(0, 20));
+            string context = $"{parameters} over [{string.Join(", ", data.Select(w => $"0x{w:X8}"))}]";
+
+            Assert.That(
+                crc32.Compute(data),
+                Is.EqualTo(ReferenceModel(parameters, ToBigEndianBytes(data))),
+                $"big-endian: {context}");
+
+            Assert.That(
+                crc32.ComputeLittleEndian(data),
+                Is.EqualTo(ReferenceModel(parameters, ToLittleEndianBytes(data))),
+                $"little-endian: {context}");
+        }
     }
 
     [Test]
-    public void Compute_EmptyInput_ReturnsInitialValue()
+    public void ArbitraryParameters_AreExposedUnchanged()
     {
-        uint actual = Crc32.Compute([]);
+        Crc32Parameters parameters = new(0xDEADBEEF, 0x0BADF00D, ReflectInput: true, ReflectOutput: false, 0x12345678);
 
-        Assert.That(actual, Is.EqualTo(Crc32.InitialValue));
+        Assert.That(new Crc32(parameters).Parameters, Is.EqualTo(parameters));
     }
 
-    [TestCaseSource(nameof(KnownValues))]
-    public uint Compute_KnownInput_ReturnsExpectedCrc(uint[] data) => Crc32.Compute(data);
+    [Test]
+    public void ReflectedInitialRegister_IsBitReverseOfInitialValue()
+    {
+        // 0x0000FFFF reverses to 0xFFFF0000, so this would survive a no-op "reversal".
+        Crc32Parameters parameters = new(0x04C11DB7, 0x0000FFFF, ReflectInput: true, ReflectOutput: true, 0);
 
-    private static IEnumerable<TestCaseData> KnownValues()
+        Assert.That(new Crc32(parameters).InitialRegister, Is.EqualTo(0xFFFF0000u));
+    }
+
+    [Test]
+    public void ForwardInitialRegister_IsInitialValueUnchanged()
+    {
+        Crc32Parameters parameters = new(0x04C11DB7, 0x0000FFFF, ReflectInput: false, ReflectOutput: false, 0);
+
+        Assert.That(new Crc32(parameters).InitialRegister, Is.EqualTo(0x0000FFFFu));
+    }
+
+    // ------------------------------------------------------------ known values
+
+    /// <summary>
+    /// The values this library produced before <see cref="Crc32Parameters"/> existed, when
+    /// MPEG-2 was hard-coded. They must not have moved.
+    /// </summary>
+    [TestCaseSource(nameof(KnownMpeg2BigEndianValues))]
+    public uint Mpeg2_Compute_KnownInput_ReturnsExpectedCrc(uint[] data) => Crc32.Mpeg2.Compute(data);
+
+    private static IEnumerable<TestCaseData> KnownMpeg2BigEndianValues()
     {
         yield return new TestCaseData(Array.Empty<uint>()).Returns(0xFFFFFFFFu);
         yield return new TestCaseData(new uint[] { 0x00000000 }).Returns(0xC704DD7Bu);
@@ -43,80 +202,11 @@ public class Crc32Tests
         yield return new TestCaseData(new uint[] { 1, 2, 3, 4 }).Returns(0x955AE3FDu);
     }
 
-    [Test]
-    public void Compute_ConsumesEachWordMostSignificantByteFirst()
-    {
-        // A word and its byte-swap must not collide, and each must agree with the
-        // reference fed that word's bytes in descending significance.
-        using (Assert.EnterMultipleScope())
-        {
-            Assert.That(Crc32.Compute([0x12345678]), Is.EqualTo(ReferenceBitwise([0x12, 0x34, 0x56, 0x78])));
-            Assert.That(Crc32.Compute([0x78563412]), Is.EqualTo(ReferenceBitwise([0x78, 0x56, 0x34, 0x12])));
-            Assert.That(Crc32.Compute([0x12345678]), Is.Not.EqualTo(Crc32.Compute([0x78563412])));
-        }
-    }
+    [TestCaseSource(nameof(KnownMpeg2LittleEndianValues))]
+    public uint Mpeg2_ComputeLittleEndian_KnownInput_ReturnsExpectedCrc(uint[] data) =>
+        Crc32.Mpeg2.ComputeLittleEndian(data);
 
-    [Test]
-    public void Compute_MatchesByteReference_ForRandomInput()
-    {
-        Random random = new(20250811);
-
-        for (int length = 0; length <= 64; length++)
-        {
-            uint[] data = new uint[length];
-            for (int i = 0; i < length; i++)
-            {
-                data[i] = (uint)random.NextInt64(uint.MinValue, (long)uint.MaxValue + 1);
-            }
-
-            uint actual = Crc32.Compute(data);
-            uint expected = ReferenceBitwise(ToBigEndianBytes(data));
-
-            Assert.That(actual, Is.EqualTo(expected), $"length {length}: [{string.Join(", ", data.Select(w => $"0x{w:X8}"))}]");
-        }
-    }
-
-    [Test]
-    public void Compute_WithInitialValueSeed_MatchesDefaultOverload()
-    {
-        uint[] data = [0x12345678, 0x9ABCDEF0, 0xDEADBEEF];
-
-        Assert.That(Crc32.Compute(data, Crc32.InitialValue), Is.EqualTo(Crc32.Compute(data)));
-    }
-
-    [Test]
-    public void Compute_SeededWithPreviousResult_MatchesSinglePassOverConcatenation()
-    {
-        uint[] head = [0x12345678, 0x9ABCDEF0];
-        uint[] tail = [0xDEADBEEF, 0x0BADF00D, 0x00000000];
-
-        uint chained = Crc32.Compute(tail, Crc32.Compute(head));
-        uint singlePass = Crc32.Compute([.. head, .. tail]);
-
-        Assert.That(chained, Is.EqualTo(singlePass));
-    }
-
-    [Test]
-    public void Compute_EmptyInputWithSeed_ReturnsSeedUnchanged()
-    {
-        const uint seed = 0xDEADBEEF;
-
-        Assert.That(Crc32.Compute([], seed), Is.EqualTo(seed));
-    }
-
-    [Test]
-    public void ComputeLittleEndian_EmptyInput_ReturnsInitialValue()
-    {
-        uint actual = Crc32.ComputeLittleEndian([]);
-
-        Assert.That(actual, Is.EqualTo(Crc32.InitialValue));
-    }
-
-    [TestCaseSource(nameof(KnownLittleEndianValues))]
-    public uint ComputeLittleEndian_KnownInput_ReturnsExpectedCrc(uint[] data) =>
-        Crc32.ComputeLittleEndian(data);
-
-    private static IEnumerable<TestCaseData> KnownLittleEndianValues()
+    private static IEnumerable<TestCaseData> KnownMpeg2LittleEndianValues()
     {
         yield return new TestCaseData(Array.Empty<uint>()).Returns(0xFFFFFFFFu);
         yield return new TestCaseData(new uint[] { 0x00000000 }).Returns(0xC704DD7Bu);
@@ -127,101 +217,125 @@ public class Crc32Tests
         yield return new TestCaseData(new uint[] { 1, 2, 3, 4 }).Returns(0xE56072A5u);
     }
 
+    // ------------------------------------------------------------- byte order
+
+    [Test]
+    public void Compute_ConsumesEachWordMostSignificantByteFirst()
+    {
+        Assert.That(
+            Crc32.Mpeg2.Compute([0x12345678]),
+            Is.EqualTo(ReferenceModel(Crc32Parameters.Mpeg2, [0x12, 0x34, 0x56, 0x78])));
+    }
+
     [Test]
     public void ComputeLittleEndian_ConsumesEachWordLeastSignificantByteFirst()
     {
         Assert.That(
-            Crc32.ComputeLittleEndian([0x12345678]),
-            Is.EqualTo(ReferenceBitwise([0x78, 0x56, 0x34, 0x12])));
+            Crc32.Mpeg2.ComputeLittleEndian([0x12345678]),
+            Is.EqualTo(ReferenceModel(Crc32Parameters.Mpeg2, [0x78, 0x56, 0x34, 0x12])));
     }
 
-    [Test]
-    public void ComputeLittleEndian_MatchesByteReference_ForRandomInput()
+    [TestCaseSource(nameof(Presets))]
+    public void ComputeLittleEndian_EqualsComputeOverByteSwappedWords(Preset preset)
     {
-        Random random = new(20250811);
-
-        for (int length = 0; length <= 64; length++)
-        {
-            uint[] data = new uint[length];
-            for (int i = 0; i < length; i++)
-            {
-                data[i] = (uint)random.NextInt64(uint.MinValue, (long)uint.MaxValue + 1);
-            }
-
-            uint actual = Crc32.ComputeLittleEndian(data);
-            uint expected = ReferenceBitwise(ToLittleEndianBytes(data));
-
-            Assert.That(actual, Is.EqualTo(expected), $"length {length}: [{string.Join(", ", data.Select(w => $"0x{w:X8}"))}]");
-        }
-    }
-
-    [Test]
-    public void ComputeLittleEndian_EqualsBigEndianOverByteSwappedWords()
-    {
-        Random random = new(19700101);
-        uint[] data = new uint[37];
-        for (int i = 0; i < data.Length; i++)
-        {
-            data[i] = (uint)random.NextInt64(uint.MinValue, (long)uint.MaxValue + 1);
-        }
-
+        uint[] data = RandomWords(new Random(31337), 37);
         uint[] swapped = new uint[data.Length];
         BinaryPrimitives.ReverseEndianness(data, swapped);
 
-        Assert.That(Crc32.ComputeLittleEndian(data), Is.EqualTo(Crc32.Compute(swapped)));
+        Assert.That(preset.Instance.ComputeLittleEndian(data), Is.EqualTo(preset.Instance.Compute(swapped)));
     }
 
     [Test]
-    public void ComputeLittleEndian_DiffersFromBigEndian_ForAsymmetricInput()
+    public void ComputeLittleEndian_DiffersFromCompute_ForAsymmetricInput()
     {
-        // A word that is not a palindrome in bytes must checksum differently under the
-        // two orderings, or the swap is not happening at all.
-        Assert.That(Crc32.ComputeLittleEndian([0x12345678]), Is.Not.EqualTo(Crc32.Compute([0x12345678])));
-    }
-
-    [Test]
-    public void ComputeLittleEndian_SeededWithPreviousResult_MatchesSinglePassOverConcatenation()
-    {
-        uint[] head = [0x12345678, 0x9ABCDEF0];
-        uint[] tail = [0xDEADBEEF, 0x0BADF00D, 0x00000000];
-
-        uint chained = Crc32.ComputeLittleEndian(tail, Crc32.ComputeLittleEndian(head));
-        uint singlePass = Crc32.ComputeLittleEndian([.. head, .. tail]);
-
-        Assert.That(chained, Is.EqualTo(singlePass));
-    }
-
-    [Test]
-    public void ComputeLittleEndian_WithInitialValueSeed_MatchesDefaultOverload()
-    {
-        uint[] data = [0x12345678, 0x9ABCDEF0, 0xDEADBEEF];
-
         Assert.That(
-            Crc32.ComputeLittleEndian(data, Crc32.InitialValue),
-            Is.EqualTo(Crc32.ComputeLittleEndian(data)));
+            Crc32.Mpeg2.ComputeLittleEndian([0x12345678]),
+            Is.Not.EqualTo(Crc32.Mpeg2.Compute([0x12345678])));
     }
+
+    // ------------------------------------------------------------- distinctness
+
+    [Test]
+    public void Presets_ProduceDistinctResults_ForTheSameInput()
+    {
+        uint[] data = RandomWords(new Random(8675309), 16);
+
+        uint[] results = Presets().Select(preset => preset.Instance.Compute(data)).ToArray();
+
+        Assert.That(results, Is.Unique);
+    }
+
+    // ------------------------------------------------------------------ oracle
 
     /// <summary>
-    /// A deliberately naive bit-at-a-time CRC over bytes, serving as the oracle. The
-    /// parameters are written out as literals rather than read from <see cref="Crc32"/>
-    /// so that a wrong constant in the implementation cannot propagate into the expected
-    /// value and hide itself.
+    /// Williams' model spelled out literally: feed each byte in at the top of the register,
+    /// clock it one bit at a time, reflect on the way in and out where asked. Deliberately
+    /// naive and structurally unlike the table-driven implementation, so the two are unlikely
+    /// to share a mistake. Its own bit reversals are loop-based rather than the library's
+    /// bit-twiddling version, for the same reason.
     /// </summary>
-    private static uint ReferenceBitwise(ReadOnlySpan<byte> data)
+    private static uint ReferenceModel(Crc32Parameters parameters, ReadOnlySpan<byte> data)
     {
-        uint crc = 0xFFFFFFFF;
+        uint crc = parameters.InitialValue;
 
-        foreach (byte value in data)
+        foreach (byte raw in data)
         {
+            byte value = parameters.ReflectInput ? ReverseByte(raw) : raw;
             crc ^= (uint)value << 24;
 
             for (int round = 0; round < 8; round++)
             {
-                crc = (crc & 0x80000000) != 0 ? (crc << 1) ^ 0x04C11DB7 : crc << 1;
+                crc = (crc & 0x80000000) != 0 ? (crc << 1) ^ parameters.Polynomial : crc << 1;
             }
         }
 
-        return crc;
+        if (parameters.ReflectOutput)
+        {
+            crc = ReverseWord(crc);
+        }
+
+        return crc ^ parameters.XorOut;
+    }
+
+    private static byte ReverseByte(byte value)
+    {
+        int reversed = 0;
+
+        for (int bit = 0; bit < 8; bit++)
+        {
+            reversed = (reversed << 1) | ((value >> bit) & 1);
+        }
+
+        return (byte)reversed;
+    }
+
+    private static uint ReverseWord(uint value)
+    {
+        uint reversed = 0;
+
+        for (int bit = 0; bit < 32; bit++)
+        {
+            reversed = (reversed << 1) | ((value >> bit) & 1);
+        }
+
+        return reversed;
+    }
+
+    // ----------------------------------------------------------------- helpers
+
+    private static uint RandomWord(Random random) =>
+        (uint)random.NextInt64(uint.MinValue, (long)uint.MaxValue + 1);
+
+    private static uint[] RandomWords(Random random, int length)
+    {
+        uint[] data = new uint[length];
+
+        for (int i = 0; i < length; i++)
+        {
+            data[i] = RandomWord(random);
+        }
+
+        return data;
     }
 
     private static byte[] ToBigEndianBytes(ReadOnlySpan<uint> data)

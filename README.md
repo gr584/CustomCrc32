@@ -1,173 +1,188 @@
 # CustomCrc32
 
-A CRC-32 implementation for input arriving as **32-bit words** rather than bytes, computed
-most-significant-bit-first with polynomial `0x04C11DB7`, initial value `0xFFFFFFFF` and no
-final XOR.
-
-These parameters are the ones catalogued as **CRC-32/MPEG-2**. They are *not* the zlib /
-PNG / gzip variant that "CRC-32" usually refers to — see
-[Using a different variant](#using-a-different-variant) if that is what you were after.
-
-## Parameters
-
-| Property   | Value        | Notes                                                      |
-| ---------- | ------------ | ---------------------------------------------------------- |
-| Width      | 32 bits      |                                                            |
-| Polynomial | `0x04C11DB7` | Normal (non-reversed) form                                 |
-| Init       | `0xFFFFFFFF` | Also the CRC of empty input                                |
-| RefIn      | false        | Input is not reflected; each word is consumed MSB-first    |
-| RefOut     | false        | Output is not reflected                                    |
-| XorOut     | `0x00000000` | A no-op, retained in the source to document the parameter  |
-| Check      | `0x0376E6E7` | CRC of the ASCII bytes `123456789`                         |
-
-The check value is the standard cross-implementation anchor for this parameter set and is
-asserted by the test suite.
-
-## Requirements
-
-- .NET 8.0 SDK or newer. All three projects target `net8.0`; the repository has been built
-  and tested with SDK 10.0.303.
-- No runtime package dependencies — the library is plain BCL code.
-
-## API
-
-`CustomCrc32.Crc32` is a static class.
-
-```csharp
-public static class Crc32
-{
-    public const uint Polynomial   = 0x04C11DB7;
-    public const uint InitialValue = 0xFFFFFFFF;
-    public const uint XorOut       = 0x00000000;
-
-    // Big-endian: each word contributes its most significant byte first.
-    public static uint Compute(ReadOnlySpan<uint> data);
-    public static uint Compute(ReadOnlySpan<uint> data, uint seed);
-
-    // Little-endian: each word contributes its least significant byte first.
-    public static uint ComputeLittleEndian(ReadOnlySpan<uint> data);
-    public static uint ComputeLittleEndian(ReadOnlySpan<uint> data, uint seed);
-}
-```
-
-The parameter is `ReadOnlySpan<uint>`, so a `Span<uint>`, a `uint[]`, a stack-allocated
-buffer or a collection expression all bind without a cast.
-
-- **`Compute(data)`** — one-shot, big-endian. Returns `InitialValue` for empty input.
-- **`Compute(data, seed)`** — resumes from a previous register state, so a stream can be
-  checksummed in pieces. Because `XorOut` is zero, feeding one call's result in as the next
-  call's seed gives exactly the same answer as a single pass over the concatenated input.
-- **`ComputeLittleEndian(…)`** — the same, over the little-endian serialisation of the
-  words: `0x12345678` is checksummed as the bytes `78 56 34 12`. Use this when the words
-  are values you intend to write out least significant byte first. Both overloads behave
-  and chain exactly like their big-endian counterparts.
-
-Which one you want depends on the byte order your words will be *serialised* in, not on the
-byte order of the machine you are running on — see
-[A note on endianness](#a-note-on-endianness).
-
-## Usage
+A configurable 32-bit CRC for input arriving as **32-bit words** rather than bytes. Any
+parameter set expressible in the Rocksoft/Williams model works, including reflected variants,
+and twelve catalogued CRC-32s ship as named presets.
 
 ```csharp
 using CustomCrc32;
 
 uint[] words = [0x12345678, 0x9ABCDEF0];
 
-uint bigEndian    = Crc32.Compute(words);              // 0x7D24A31B
-uint littleEndian = Crc32.ComputeLittleEndian(words);  // 0x170FFA3D
+uint crc = Crc32.Mpeg2.Compute(words);      // 0x7D24A31B
+uint zlib = Crc32.IsoHdlc.Compute(words);   // the usual "CRC-32"
 ```
 
-Checksumming a stream in chunks:
+## Requirements
+
+- .NET 8.0 SDK or newer. All three projects target `net8.0`; built and tested with SDK 10.0.303.
+- No runtime package dependencies — the library is plain BCL code.
+
+## Presets
+
+| Preset       | Polynomial   | Init         | RefIn | RefOut | XorOut       | Check        |
+| ------------ | ------------ | ------------ | ----- | ------ | ------------ | ------------ |
+| `IsoHdlc`    | `0x04C11DB7` | `0xFFFFFFFF` | yes   | yes    | `0xFFFFFFFF` | `0xCBF43926` |
+| `Mpeg2`      | `0x04C11DB7` | `0xFFFFFFFF` | no    | no     | `0x00000000` | `0x0376E6E7` |
+| `Bzip2`      | `0x04C11DB7` | `0xFFFFFFFF` | no    | no     | `0xFFFFFFFF` | `0xFC891918` |
+| `Castagnoli` | `0x1EDC6F41` | `0xFFFFFFFF` | yes   | yes    | `0xFFFFFFFF` | `0xE3069283` |
+| `JamCrc`     | `0x04C11DB7` | `0xFFFFFFFF` | yes   | yes    | `0x00000000` | `0x340BC6D9` |
+| `Cksum`      | `0x04C11DB7` | `0x00000000` | no    | no     | `0xFFFFFFFF` | `0x765E7680` |
+| `Aixm`       | `0x814141AB` | `0x00000000` | no    | no     | `0x00000000` | `0x3010BF7F` |
+| `Autosar`    | `0xF4ACFB13` | `0xFFFFFFFF` | yes   | yes    | `0xFFFFFFFF` | `0x1697D06A` |
+| `Base91D`    | `0xA833982B` | `0xFFFFFFFF` | yes   | yes    | `0xFFFFFFFF` | `0x87315576` |
+| `CdRomEdc`   | `0x8001801B` | `0x00000000` | yes   | yes    | `0x00000000` | `0x6EC2EDC4` |
+| `Mef`        | `0x741B8CD7` | `0xFFFFFFFF` | yes   | yes    | `0x00000000` | `0xD2C22F51` |
+| `Xfer`       | `0x000000AF` | `0x00000000` | no    | no     | `0x00000000` | `0xBD0BE338` |
+
+*Check* is the CRC of the ASCII bytes `123456789`, the conventional cross-implementation
+anchor. Every one is asserted by the test suite.
+
+`IsoHdlc` is what "CRC-32" normally means — zlib, PNG, gzip, Ethernet, ZIP. `Castagnoli` is
+CRC-32C, used by iSCSI, ext4, Btrfs and SCTP.
+
+Two notes on the more surprising entries. `Cksum` is the polynomial POSIX `cksum` uses, but
+that utility also appends the message length to the input before checksumming; this library
+does not do that for you. And `Mpeg2` is the parameter set this project was originally
+written around, kept as a preset.
+
+Each name exists in two places: `Crc32Parameters.Mpeg2` is the parameter *values*, and
+`Crc32.Mpeg2` is a ready-to-use shared instance.
+
+## API
 
 ```csharp
-uint crc = Crc32.InitialValue;
-while (TryReadChunk(out ReadOnlySpan<uint> chunk))
+public readonly record struct Crc32Parameters(
+    uint Polynomial,      // normal (non-reversed) form, even for reflected variants
+    uint InitialValue,
+    bool ReflectInput,
+    bool ReflectOutput,
+    uint XorOut);
+
+public sealed class Crc32
 {
-    crc = Crc32.Compute(chunk, crc);
+    public Crc32(Crc32Parameters parameters);
+
+    public Crc32Parameters Parameters { get; }
+    public uint InitialRegister { get; }
+
+    // One-shot. The suffix selects the byte order the words are serialised in.
+    public uint Compute(ReadOnlySpan<uint> data);
+    public uint ComputeLittleEndian(ReadOnlySpan<uint> data);
+
+    // Streaming.
+    public uint Append(uint register, ReadOnlySpan<uint> data);
+    public uint AppendLittleEndian(uint register, ReadOnlySpan<uint> data);
+    public uint Finish(uint register);
 }
-// crc now equals Crc32.Compute(everything)
 ```
 
-Known values, all covered by tests:
+An instance owns the 256-entry table derived from its parameters, so **construct one per
+parameter set and reuse it**. Instances are immutable and safe to use concurrently. The
+presets are shared instances, so `Crc32.Mpeg2.Compute(…)` allocates nothing.
 
-| Input                                              | `Compute` (BE) | `ComputeLittleEndian` |
-| -------------------------------------------------- | -------------- | --------------------- |
-| *(empty)*                                          | `0xFFFFFFFF`   | `0xFFFFFFFF`          |
-| `[0x00000000]`                                     | `0xC704DD7B`   | `0xC704DD7B`          |
-| `[0xFFFFFFFF]`                                     | `0x00000000`   | `0x00000000`          |
-| `[0x12345678]`                                     | `0xDF8A8A2B`   | `0xAD37D056`          |
-| `[0x9ABCDEF0]`                                     | `0x25D59E18`   | `0x5768C465`          |
-| `[0x12345678, 0x9ABCDEF0]`                         | `0x7D24A31B`   | `0x170FFA3D`          |
-| `[0x00000001, 0x00000002, 0x00000003, 0x00000004]` | `0x955AE3FD`   | `0xE56072A5`          |
+The input parameter is `ReadOnlySpan<uint>`, so a `Span<uint>`, a `uint[]`, a stack-allocated
+buffer or a collection expression all bind without a cast.
 
-The two columns coincide only where every word is a byte-palindrome. Note
-`Compute([0x78563412]) == ComputeLittleEndian([0x12345678]) == 0xAD37D056`, which is the
-byte-swap identity the implementation relies on.
+### Custom parameters
+
+```csharp
+var crc32 = new Crc32(new Crc32Parameters(
+    Polynomial:    0x04C11DB7,
+    InitialValue:  0xFFFFFFFF,
+    ReflectInput:  false,
+    ReflectOutput: false,
+    XorOut:        0x00000000));
+
+uint crc = crc32.Compute(words);
+```
+
+Give the polynomial in **normal form** even for a reflected variant — pass `0x04C11DB7`, not
+`0xEDB88320`. The reversal is applied internally.
+
+### Streaming
+
+`Compute` is `Finish(Append(InitialRegister, data))`. Splitting those apart lets you
+checksum a stream in pieces:
+
+```csharp
+uint register = crc32.InitialRegister;
+while (TryReadChunk(out ReadOnlySpan<uint> chunk))
+{
+    register = crc32.Append(register, chunk);
+}
+uint crc = crc32.Finish(register);
+```
+
+`Append` returns the **raw register**, not a CRC — output reflection and the final XOR are
+applied by `Finish`. Keep them apart: feeding a finished value back into `Append` gives a
+wrong answer for any parameter set with a non-zero `XorOut` or mismatched reflection.
 
 ## A note on endianness
 
 The input is typed as `uint`, not as raw bytes, so **the host machine's endianness never
-enters into it**. The algorithm consumes each word from bit 31 down to bit 0 regardless of
-how that word happens to be laid out in memory. "Big-endian" here describes the *bit
-ordering within each word* — the most significant byte contributes first — which is
-inherent to an MSB-first CRC and is what makes this equivalent to feeding the word's four
-bytes in descending significance.
+enters into it**. The algorithm consumes each word bit by bit regardless of how that word is
+laid out in memory. The choice between `Compute` and `ComputeLittleEndian` is about the byte
+order your words will be *serialised* in, and the same call returns the same answer on x64,
+ARM, or anything else.
 
-So the choice between `Compute` and `ComputeLittleEndian` is about **the byte order your
-words will be serialised in**, not about the machine you are running on. The same call
-returns the same answer on x64, ARM, or anything else.
+- `Compute` — each word contributes its most significant byte first: `0x12345678` is
+  checksummed as the bytes `12 34 56 78`.
+- `ComputeLittleEndian` — least significant byte first: `78 56 34 12`.
 
-`ComputeLittleEndian` swaps each word as it is folded in, using a single `bswap` on the
-incoming word. Because the swap acts on the input rather than on the CRC register, it sits
-off the dependency chain the four table lookups form and overlaps with them — the benchmark
-below shows it costs nothing measurable. It is therefore always preferable to pre-swapping
-the buffer with `BinaryPrimitives.ReverseEndianness`, which allocates and makes an extra
-pass.
+Each engine folds a word naturally in one of those two directions and byte-swaps for the
+other. Which is which flips with `ReflectInput`: the forward engine's natural direction is
+big-endian, the reflected engine's is little-endian. The swap is a single `bswap` acting on
+the incoming word rather than on the CRC register, so it carries no dependency on the
+previous iteration and costs nothing measurable — see the benchmarks below. Never pre-swap
+the buffer with `BinaryPrimitives.ReverseEndianness`; that allocates and adds a pass.
 
 ### The one case this does not cover
 
-If your data actually arrives as a **byte** buffer that you are reinterpreting as `uint`
-(via `MemoryMarshal.Cast` or similar), neither method is the right tool, and the cast is a
-trap: a big-endian buffer `12 34 56 78` read through `MemoryMarshal.Cast<byte, uint>` on a
-little-endian host yields `0x78563412` — silently the wrong word, with no error and a wrong
-CRC at the end.
+If your data actually arrives as a **byte** buffer that you are reinterpreting as `uint` (via
+`MemoryMarshal.Cast` or similar), neither method is the right tool, and the cast is a trap: a
+big-endian buffer `12 34 56 78` read through `MemoryMarshal.Cast<byte, uint>` on a
+little-endian host yields `0x78563412` — silently the wrong word, no error, wrong CRC.
 
-For that case the correct fix is not to cast at all, but to process the bytes directly with
-the same table:
-
-```csharp
-crc = (crc << 8) ^ Table[((crc >> 24) ^ value) & 0xFF];
-```
-
-That removes the endianness question entirely and handles buffers whose length is not a
-multiple of four, which the word-based API structurally cannot. No such overload ships
-today — ask if you need one. It would want a distinct name (`ComputeBytes`) rather than an
-overload of `Compute`, because overloading on `ReadOnlySpan<byte>` alongside
-`ReadOnlySpan<uint>` makes collection-expression calls like `Compute([])` ambiguous.
+The correct fix is not to cast at all but to process bytes directly, which also handles
+lengths that are not a multiple of four. No byte-oriented overload ships today — ask if you
+need one. It would want a distinct name (`ComputeBytes`) rather than an overload, because
+overloading on `ReadOnlySpan<byte>` alongside `ReadOnlySpan<uint>` makes collection-expression
+calls like `Compute([])` ambiguous.
 
 ## Implementation notes
 
-`Crc32` is table-driven. A 256-entry table maps a leading byte to the register
-state produced by clocking it through eight rounds, so a whole byte folds in with one
-lookup. The table is built once in a static initialiser (the CLR guarantees that is
-thread-safe and runs at most once).
+Each instance derives a 256-entry table mapping a byte to the register state produced by
+clocking it through eight rounds, so a whole byte folds in with one lookup.
 
-Each word is processed as:
+There are two engines, selected by `ReflectInput`, because a reflected CRC is not the same
+algorithm with different constants — it runs the register the other way:
+
+|                | Forward (`ReflectInput: false`)         | Reflected (`ReflectInput: true`)      |
+| -------------- | --------------------------------------- | ------------------------------------- |
+| Register step  | `(r << 8) ^ table[r >> 24]`             | `(r >> 8) ^ table[r & 0xFF]`          |
+| Table entry    | from `i << 24`, shifting left           | from `i`, shifting right              |
+| Polynomial     | as given                                | bit-reversed once, at construction    |
+| Start register | `InitialValue`                          | `Reverse(InitialValue)`               |
+| Natural fold   | big-endian                              | little-endian                         |
+
+A reflected CRC is run with the register held bit-reversed throughout, which is why the
+initial value is reversed on the way in. On the way out, `ReflectOutput` asks for the
+reversed register — which is what is already there — so `Finish` reverses only when
+`ReflectInput != ReflectOutput`.
+
+Each word is folded whole and then clocked through the 32 rounds it owes, a byte per lookup:
 
 ```csharp
-crc ^= word;
-crc = (crc << 8) ^ Table[crc >> 24];   // ×4
+register ^= word;
+register = (register << 8) ^ table[register >> 24];   // ×4
 ```
 
-That is, **fold the entire word in first, then clock the register through the 32 rounds it
-owes**, a byte per lookup. The fold-then-shift order is what makes this bit-identical to
-the conventional byte-at-a-time loop fed `b3, b2, b1, b0`.
-
-Both public entry points share that step as a private `Fold` helper; `ComputeLittleEndian`
-differs only in passing `BinaryPrimitives.ReverseEndianness(word)` instead of `word`.
+That fold-then-shift order is what makes it bit-identical to the conventional byte-at-a-time
+loop fed `b3, b2, b1, b0`.
 
 <details>
-<summary>Why the two are equivalent</summary>
+<summary>Why word-at-a-time equals byte-at-a-time</summary>
 
 Let `S` be the one-bit shift-and-reduce step; it is linear over GF(2). The byte-at-a-time
 loop XORs each byte in at bit 24 and applies `S⁸`, which unrolls to:
@@ -184,46 +199,50 @@ S³²(crc) ^ S³²(b3<<24) ^ S³²(b2<<16) ^ S³²(b1<<8) ^ S³²(b0)
 
 These agree because `S⁸(x<<16) = x<<24` for any byte `x`: the occupied bits start at
 positions 16–23, and across those eight shifts the top bit is never set at the moment it is
-tested, so no polynomial reduction occurs and `S⁸` degenerates to a plain `<<8`. Applying
-that identity to each staggered term lines the two expansions up exactly.
+tested, so no reduction occurs and `S⁸` degenerates to a plain `<<8`. Applying that identity
+to each staggered term lines the two expansions up exactly. The reflected engine is the
+mirror image, and the same argument holds with the shifts reversed.
 
-This was also confirmed numerically before the implementation was written, and is pinned by
-tests.
+Verified numerically across all four `ReflectInput`/`ReflectOutput` combinations with random
+polynomials, initial values and final XORs before the implementation was written.
 </details>
 
 ## Correctness
 
-The test suite ([`CustomCrc32.Test`](CustomCrc32.Test/Crc32Tests.cs), NUnit, 29 tests) uses
-a two-layer oracle rather than trusting hand-computed constants:
+The test suite ([`CustomCrc32.Test`](CustomCrc32.Test/Crc32Tests.cs), NUnit, 119 tests) is
+built on a single oracle: **Williams' model spelled out literally** — feed each byte in at
+the top of the register, clock it one bit at a time, reflect on the way in and out where
+asked. It is deliberately naive and structurally unlike the table-driven implementation, and
+its own bit reversals are loop-based rather than the library's bit-twiddling version, so the
+two are unlikely to share a mistake.
 
-1. A deliberately naive **bit-at-a-time reference over bytes** with the parameters written
-   out as literals rather than read from `Crc32`, so a wrong constant in the implementation
-   cannot propagate into the expected value and hide itself. That reference is anchored to
-   the published check value `0x0376E6E7` for `123456789`.
-2. Each shipping method is then cross-checked against that reference over 65 random inputs
-   (lengths 0–64 words, fixed seed) — expanded big-endian for `Compute`, little-endian for
-   `ComputeLittleEndian` — plus the literal known values above.
+That oracle is anchored by the twelve published check values: running each preset's
+parameters over `123456789` must reproduce the catalogued constant. Passing means the preset
+constants *and* the reference model are both right — agreeing by accident on a 32-bit value
+twelve times over is not a thing that happens.
 
-Also covered, for both orderings: empty input, empty input with a seed, the default overload
-agreeing with an explicit `InitialValue` seed, and seed-chaining matching a single pass over
-the concatenation. Byte-order specifically is pinned from three directions — a word and its
-byte-swap must not collide, `ComputeLittleEndian` must differ from `Compute` on an
-asymmetric word, and `ComputeLittleEndian(data)` must equal `Compute(swapped)` over a random
-buffer.
+Everything else is then checked against the oracle:
 
-A mutation check confirms the suite is not vacuous — flipping one bit of the polynomial
-(`0x04C11DB7` → `0x04C11DB6`) fails 7 of the then-14 tests.
+- Every preset, both byte orders, over inputs of length 0–40 words.
+- **Arbitrary parameters** — 400 random parameter sets, both byte orders. This is the load-
+  bearing test: the presets all have `RefIn == RefOut` and a bit-reversal-palindrome initial
+  value, so only random parameters exercise mismatched reflection and asymmetric inits.
+- Streaming: chunked `Append`/`AppendLittleEndian` then `Finish` must equal the one-shot
+  result, for every preset, including a zero-length chunk.
+- `InitialRegister` is the reversed initial value when reflected and unchanged when not,
+  pinned with `0x0000FFFF` — a value that would survive a no-op "reversal".
+- Byte order: `ComputeLittleEndian(data)` equals `Compute(swapped)` for every preset, and
+  differs from `Compute(data)` on an asymmetric word.
+- All twelve presets produce distinct results for the same input.
+- The fifteen MPEG-2 values this library produced before `Crc32Parameters` existed still
+  hold, so the migration is known not to have moved any answers.
 
 ## Benchmarks
 
-[`CustomCrc32.Benchmarks`](CustomCrc32.Benchmarks/) uses BenchmarkDotNet to compare the
-shipping table-driven implementation against the bit-at-a-time formulation of the same CRC,
-across input sizes chosen to sit at different levels of the memory hierarchy. Bitwise is the
-baseline, since it is what the table lookup replaces.
-
-`GlobalSetup` throws if the implementations disagree — a speed comparison stops meaning
-anything once the baseline has diverged. It checks both that bitwise matches table-driven,
-and that `ComputeLittleEndian(data)` matches `Compute(swapped)`.
+[`CustomCrc32.Benchmarks`](CustomCrc32.Benchmarks/) compares both engines against the
+bit-at-a-time formulation, across input sizes chosen to sit at different levels of the memory
+hierarchy. `GlobalSetup` throws if any two paths that should agree have diverged — a speed
+comparison stops meaning anything once the baseline is wrong.
 
 `ThroughputColumn` is a custom `IColumn` adding a GB/s column derived from the mean and the
 `WordCount` parameter. BenchmarkDotNet has no built-in throughput column, and
@@ -239,45 +258,55 @@ Extra arguments are forwarded to BenchmarkDotNet (`-- --job short`, `--filter`, 
 
 Intel Xeon E-2174G @ 3.80 GHz (4 physical / 8 logical cores), Windows 11 25H2, .NET 8.0.30
 X64 RyuJIT x86-64-v3, BenchmarkDotNet 0.15.8. **Taken with `--job short`** (3 warmup + 3
-iterations) — good enough for the headline ratio, but re-run with the default job before
+iterations) — good enough for the headline ratios, but re-run with the default job before
 quoting these anywhere.
 
-| WordCount        | Bitwise    | Table-driven (BE) | Table-driven (LE) | Speedup |
-| ---------------- | ---------- | ----------------- | ----------------- | ------- |
-| 16 (64 B)        | 114 MB/s   | 661 MB/s          | 643 MB/s          | 5.8×    |
-| 256 (1 KiB)      | 38 MB/s    | 564 MB/s          | 564 MB/s          | 15×     |
-| 4,096 (16 KiB)   | 33 MB/s    | 559 MB/s          | 558 MB/s          | 17×     |
-| 65,536 (256 KiB) | 34 MB/s    | 560 MB/s          | 561 MB/s          | 16×     |
-| 262,144 (1 MiB)  | 34 MB/s    | 552 MB/s          | 561 MB/s          | 16×     |
+| WordCount        | Bitwise   | Forward BE | Forward LE | Reflected BE | Reflected LE |
+| ---------------- | --------- | ---------- | ---------- | ------------ | ------------ |
+| 16 (64 B)        | 114 MB/s  | 633 MB/s   | 640 MB/s   | 771 MB/s     | 751 MB/s     |
+| 256 (1 KiB)      | 38 MB/s   | 569 MB/s   | 574 MB/s   | 657 MB/s     | 644 MB/s     |
+| 4,096 (16 KiB)   | 34 MB/s   | 566 MB/s   | 573 MB/s   | 653 MB/s     | 642 MB/s     |
+| 65,536 (256 KiB) | 34 MB/s   | 565 MB/s   | 566 MB/s   | 649 MB/s     | 650 MB/s     |
+| 262,144 (1 MiB)  | 34 MB/s   | 556 MB/s   | 560 MB/s   | 634 MB/s     | 636 MB/s     |
 
-Steady state is ~560 MB/s and flat across sizes: the 1 KiB table fits in L1 and the input
-streams past, so the work is compute-bound rather than memory-bound. The smallest row is
-dominated by per-call overhead, which is why bitwise looks relatively better there.
+Three things worth reading off this table:
 
-**The little-endian byte swap is free.** BE and LE sit within run-to-run noise of each other
-at every size from 256 words up — at 1 MiB the LE column even comes out marginally ahead,
-which is noise, not a real win. Only the 16-word row shows a gap (≈3%), where per-call
-overhead dominates anyway. This is the expected result: the `bswap` acts on the incoming
-word, not on the CRC register, so it has no dependency on the previous iteration and
-overlaps with the four serially-dependent table lookups that set the pace.
+**The byte swap is free.** BE and LE sit within run-to-run noise of each other in both
+engines at every size. The `bswap` acts on the incoming word, not on the CRC register, so it
+has no dependency on the previous iteration and overlaps with the four serially-dependent
+table lookups that set the pace.
+
+**The reflected engine is about 15% faster**, consistently. Its index is `r & 0xFF`, a
+low-byte extract, where the forward engine needs `r >> 24`, a real shift. That sits directly
+on the load-address dependency chain, which is what paces the loop, so the difference shows
+up as throughput. If you have a free choice of parameter set and care about speed, prefer a
+reflected one.
+
+**Throughput is flat across sizes.** The 1 KiB table fits in L1 and the input streams past,
+so the work is compute-bound rather than memory-bound. The smallest row is dominated by
+per-call overhead, which is why bitwise looks relatively better there.
+
+Moving the table from a `static readonly` field to a per-instance field, which the parameter
+migration required, cost nothing measurable: forward throughput was 552–564 MB/s before and
+556–573 MB/s after.
 
 ~560 MB/s is about the expected ceiling for one-lookup-per-byte. **Slicing-by-8** — consuming
 eight bytes per round from a larger table — typically reaches 2–3 GB/s and would be the next
 step if throughput matters.
 
-Hardware CRC instructions are not a drop-in here, for a subtler reason than the polynomial:
-they all compute **reflected** CRCs. `Sse42.Crc32` on x86 is Castagnoli-only, so it is out
-regardless. ARM's `System.Runtime.Intrinsics.Arm.Crc32` does implement `0x04C11DB7` — but in
-reflected form, whereas this library is MSB-first. Bridging that needs a bit-reversal of the
-input and output, which ARM can do with `RBIT` but x86 cannot do cheaply. Slicing-by-8 is the
-portable answer.
+Hardware CRC instructions are not a drop-in, for a subtler reason than the polynomial: they
+all compute **reflected** CRCs. `Sse42.Crc32` on x86 is Castagnoli-only. ARM's
+`System.Runtime.Intrinsics.Arm.Crc32` does implement `0x04C11DB7`, but reflected. They would
+serve `Crc32.Castagnoli` and `Crc32.IsoHdlc` well and nothing else; a general
+`Crc32Parameters` engine cannot dispatch to them in the general case.
 
 ## Project layout
 
 ```
 CustomCrc32.slnx                  Solution (new-style XML format)
 ├── CustomCrc32/                  Class library — the implementation
-│   └── Crc32.cs
+│   ├── Crc32.cs                  Engines, presets, streaming API
+│   └── Crc32Parameters.cs        Parameter model and preset values
 ├── CustomCrc32.Test/             NUnit test suite
 │   └── Crc32Tests.cs
 └── CustomCrc32.Benchmarks/       BenchmarkDotNet console app
@@ -299,21 +328,31 @@ dotnet run -c Release --project CustomCrc32.Benchmarks     # run benchmarks
 
 Benchmarks must be run against a Release build; BenchmarkDotNet will refuse otherwise.
 
-## Using a different variant
+## Migrating from the hard-coded version
 
-The parameters live as constants at the top of
-[`Crc32.cs`](CustomCrc32/Crc32.cs), and the table is derived from `Polynomial` at startup,
-so switching polynomial or initial value is a one-line change. Two caveats:
+Before `Crc32Parameters`, `Crc32` was a static class fixed to CRC-32/MPEG-2.
 
-- **Reflected variants need different code, not just different constants.** The common
-  zlib / PNG / gzip CRC-32 is *reflected* (`RefIn`/`RefOut` true, polynomial `0xEDB88320` in
-  reversed form, `XorOut` `0xFFFFFFFF`). That runs the register in the opposite direction —
-  `crc = (crc >> 8) ^ Table[(crc ^ byte) & 0xFF]`, with the table built by shifting right and
-  testing the low bit. If you need that variant, .NET already ships it as
-  `System.IO.Hashing.Crc32`.
-- **A non-zero `XorOut` breaks seed-chaining.** The `Compute(data, seed)` continuation relies
-  on the returned value being the raw register state, which holds only while `XorOut` is zero.
+| Before                            | After                              |
+| --------------------------------- | ---------------------------------- |
+| `Crc32.Compute(data)`             | `Crc32.Mpeg2.Compute(data)`        |
+| `Crc32.ComputeLittleEndian(data)` | `Crc32.Mpeg2.ComputeLittleEndian(data)` |
+| `Crc32.Polynomial`                | `Crc32Parameters.Mpeg2.Polynomial` |
+| `Crc32.InitialValue`              | `Crc32Parameters.Mpeg2.InitialValue` |
+| `Crc32.XorOut`                    | `Crc32Parameters.Mpeg2.XorOut`     |
+| `Crc32.Compute(data, seed)`       | `Append` / `Finish` — see below    |
 
-If you want the parameters configurable at runtime instead of fixed, the natural shape is a
-`Crc32Parameters` record with a per-parameter-set cached table — ask and it can be
-restructured that way.
+Results are unchanged; the old MPEG-2 values are still asserted by the test suite.
+
+The seeded overload is the one real break. It used to double as both "resume from here" and
+"here is your answer", which worked only because MPEG-2 has a zero `XorOut` and symmetric
+reflection. That no longer holds in general, so resuming and finishing are now separate
+operations:
+
+```csharp
+// before
+uint crc = Crc32.Compute(tail, Crc32.Compute(head));
+
+// after
+uint register = Crc32.Mpeg2.Append(Crc32.Mpeg2.Append(Crc32.Mpeg2.InitialRegister, head), tail);
+uint crc = Crc32.Mpeg2.Finish(register);
+```
