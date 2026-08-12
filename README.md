@@ -2,9 +2,14 @@
 
 [![Build and test](https://github.com/gr584/CustomCrc32/actions/workflows/ci.yml/badge.svg)](https://github.com/gr584/CustomCrc32/actions/workflows/ci.yml)
 
-A configurable 32-bit CRC for input arriving as **32-bit words** rather than bytes. Any
-parameter set expressible in the Rocksoft/Williams model works, including reflected variants,
-and twelve catalogued CRC-32s ship as named presets.
+A configurable 32-bit CRC that takes input as **32-bit words** or as **bytes**, whichever your
+data actually is. Any parameter set expressible in the Rocksoft/Williams model works,
+including reflected variants, and twelve catalogued CRC-32s ship as named presets.
+
+The word entry points are the unusual half: they let you checksum values you hold as `uint`
+without materialising a byte buffer, choosing the serialisation order explicitly rather than
+inheriting the host's. `ComputeBytes` covers the ordinary case — a file, a packet, a wire
+message — at any length.
 
 Runs at **~21 GB/s** on x86-64 with carry-less multiply, for every parameter set rather than
 a privileged few, falling back to a table where the instructions are unavailable.
@@ -23,7 +28,11 @@ uint ofFile = Crc32.IsoHdlc.ComputeBytes(File.ReadAllBytes("payload.bin"));
 
 ## Requirements
 
-- .NET 8.0 SDK or newer. All three projects target `net8.0`; built and tested with SDK 10.0.303.
+- .NET 8.0 or newer at runtime. All three projects target `net8.0`.
+- **Building through `CustomCrc32.slnx` needs a newer SDK than 8.0.** The `.slnx` solution
+  format postdates the 8.0 CLI, which cannot parse it; CI installs the 10.0 SDK for exactly
+  that reason, and development is on 10.0.303. With an older SDK, build the individual
+  `.csproj` files instead.
 - No runtime package dependencies — the library is plain BCL code.
 - Hardware acceleration engages automatically where `PCLMULQDQ` and `SSSE3` are available,
   which on x86-64 means anything from Westmere (2010) onwards. Elsewhere — including ARM —
@@ -77,6 +86,11 @@ public sealed class Crc32
     public Crc32Parameters Parameters { get; }
     public uint InitialRegister { get; }
 
+    // Shared preset instances — one per row of the table above.
+    public static Crc32 IsoHdlc { get; }
+    public static Crc32 Mpeg2 { get; }
+    // …and ten more
+
     // One-shot over words. The suffix selects the byte order the words are serialised in.
     public uint Compute(ReadOnlySpan<uint> data);
     public uint ComputeLittleEndian(ReadOnlySpan<uint> data);
@@ -96,8 +110,9 @@ An instance owns the 256-entry table derived from its parameters, so **construct
 parameter set and reuse it**. Instances are immutable and safe to use concurrently. The
 presets are shared instances, so `Crc32.Mpeg2.Compute(…)` allocates nothing.
 
-The input parameter is `ReadOnlySpan<uint>`, so a `Span<uint>`, a `uint[]`, a stack-allocated
-buffer or a collection expression all bind without a cast.
+Inputs are `ReadOnlySpan<uint>` or `ReadOnlySpan<byte>`, so a `Span<T>`, an array, a
+stack-allocated buffer, a UTF-8 literal (`"…"u8`) or a collection expression all bind without
+a cast.
 
 **Which entry point:** if your data is genuinely *words* — values you hold as `uint` and are
 choosing a serialisation for — use `Compute` or `ComputeLittleEndian`. If it is genuinely
@@ -140,11 +155,15 @@ wrong answer for any parameter set with a non-zero `XorOut` or mismatched reflec
 
 ## A note on endianness
 
-The input is typed as `uint`, not as raw bytes, so **the host machine's endianness never
-enters into it**. The algorithm consumes each word bit by bit regardless of how that word is
-laid out in memory. The choice between `Compute` and `ComputeLittleEndian` is about the byte
-order your words will be *serialised* in, and the same call returns the same answer on x64,
-ARM, or anything else.
+This section is about the **word** entry points. `ComputeBytes` has no endianness question at
+all — a byte buffer already carries its own order — so if that is what you are using, skip to
+[the next section](#when-the-data-is-really-bytes).
+
+Where the input is typed as `uint` rather than as raw bytes, **the host machine's endianness
+never enters into it**. The algorithm consumes each word bit by bit regardless of how that
+word is laid out in memory. The choice between `Compute` and `ComputeLittleEndian` is about
+the byte order your words will be *serialised* in, and the same call returns the same answer
+on x64, ARM, or anything else.
 
 - `Compute` — each word contributes its most significant byte first: `0x12345678` is
   checksummed as the bytes `12 34 56 78`.
@@ -152,10 +171,14 @@ ARM, or anything else.
 
 Each engine folds a word naturally in one of those two directions and byte-swaps for the
 other. Which is which flips with `ReflectInput`: the forward engine's natural direction is
-big-endian, the reflected engine's is little-endian. The swap is a single `bswap` acting on
-the incoming word rather than on the CRC register, so it carries no dependency on the
-previous iteration and costs nothing measurable — see the benchmarks below. Never pre-swap
-the buffer with `BinaryPrimitives.ReverseEndianness`; that allocates and adds a pass.
+big-endian, the reflected engine's is little-endian.
+
+The swap is free either way. In the folding path it is absorbed into the `pshufb` that each
+block already goes through, so it costs nothing at all; in the table path it is a single
+`bswap` on the incoming word rather than on the CRC register, so it carries no dependency on
+the previous iteration. Measured at every size and in both engines — see the benchmarks
+below. Never pre-swap the buffer with `BinaryPrimitives.ReverseEndianness`; that allocates
+and adds a pass.
 
 ### When the data is really bytes
 
@@ -170,7 +193,8 @@ uint check = Crc32.Mpeg2.ComputeBytes("123456789"u8); // 0x0376E6E7, the catalog
 ```
 
 Any length works, including lengths that are not a multiple of four, and a stream may be
-split **anywhere** — `AppendBytes` has no alignment to respect, unlike the word overloads:
+split **anywhere** — `AppendBytes` has no alignment to respect, whereas the word entry points
+can only express splits on a four-byte boundary:
 
 ```csharp
 uint register = crc32.InitialRegister;
@@ -201,9 +225,13 @@ kernel and runs at the same throughput, with 0–15 trailing bytes finished by t
 
 There are two layers: a carry-less-multiply fold that does the bulk of the work where the
 hardware allows, and a table that handles short inputs, the tail, and machines without the
-instructions. Both are driven by the same parameter set and produce identical answers — a
-test appends one word at a time, keeping every call under the folding threshold, and requires
-the result to match the single-shot folded call.
+instructions. Both are driven by the same parameter set and produce identical answers — one
+test appends a single word per call and another a single byte per call, keeping every call
+under the folding threshold, and both require the result to match the single-shot folded call.
+
+All three entry points share one fold kernel. `Append`, `AppendLittleEndian` and `AppendBytes`
+differ only in the byte permutation they hand it and in how they finish the tail, so the
+byte API is not a second implementation to keep in step.
 
 ### Carry-less multiply folding
 
@@ -339,9 +367,9 @@ Everything else is then checked against the oracle:
 The byte path adds a stronger anchor than any of these, because it needs no oracle at all:
 `ComputeBytes("123456789"u8)` is held directly against the twelve published check values,
 which are *defined* over bytes. Beyond that it is checked at every length from 0 to 80 bytes
-and around the larger fold boundaries, split at **every** one of 300 byte offsets rather than
-on word boundaries, against byte-at-a-time appending, against `Compute` over the same
-big-endian serialisation, and over 400 random parameter sets. One further test pins the
+and around the larger fold boundaries, split at **every** offset in a 300-byte buffer rather
+than on word boundaries, against byte-at-a-time appending, against `Compute` over the same
+big-endian serialisation, on empty input, and over 400 random parameter sets. One further test pins the
 `MemoryMarshal.Cast` relationship described above — on a little-endian host the cast agrees
 with `ComputeLittleEndian` and disagrees with `Compute` — so the trap stays documented.
 
@@ -479,6 +507,9 @@ dotnet build CustomCrc32.slnx                              # build
 dotnet test  CustomCrc32.slnx                              # run tests
 dotnet run -c Release --project CustomCrc32.Benchmarks     # run benchmarks
 ```
+
+The two solution-level commands need an SDK that understands `.slnx` — see
+[Requirements](#requirements). Point them at the individual `.csproj` files on an older one.
 
 Benchmarks must be run against a Release build; BenchmarkDotNet will refuse otherwise.
 

@@ -7,7 +7,7 @@ using System.Runtime.Intrinsics.X86;
 namespace CustomCrc32;
 
 /// <summary>
-/// A 32-bit CRC over 32-bit words, for any parameter set expressible as
+/// A 32-bit CRC over 32-bit words or over bytes, for any parameter set expressible as
 /// <see cref="Crc32Parameters"/>.
 /// </summary>
 /// <remarks>
