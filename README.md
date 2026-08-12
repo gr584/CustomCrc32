@@ -12,7 +12,8 @@ inheriting the host's. `ComputeBytes` covers the ordinary case — a file, a pac
 message — at any length.
 
 Runs at **~21 GB/s** on x86-64 with carry-less multiply, for every parameter set rather than
-a privileged few, falling back to a table where the instructions are unavailable.
+a privileged few, falling back to a table where the instructions are unavailable. Every entry
+point is allocation-free and reads the caller's buffer in place.
 
 ```csharp
 using CustomCrc32;
@@ -108,7 +109,8 @@ public sealed class Crc32
 
 An instance owns the 256-entry table derived from its parameters, so **construct one per
 parameter set and reuse it**. Instances are immutable and safe to use concurrently. The
-presets are shared instances, so `Crc32.Mpeg2.Compute(…)` allocates nothing.
+presets are shared instances, so `Crc32.Mpeg2.Compute(…)` allocates nothing — see
+[allocation and copying](#allocation-and-copying).
 
 Inputs are `ReadOnlySpan<uint>` or `ReadOnlySpan<byte>`, so a `Span<T>`, an array, a
 stack-allocated buffer, a UTF-8 literal (`"…"u8`) or a collection expression all bind without
@@ -118,6 +120,55 @@ a cast.
 choosing a serialisation for — use `Compute` or `ComputeLittleEndian`. If it is genuinely
 *bytes* — a file, a packet, a wire message — use `ComputeBytes`. The distinction is not
 cosmetic; see [endianness](#a-note-on-endianness) below.
+
+### Allocation and copying
+
+Every entry point is **allocation-free** and **zero-copy**: no call allocates on the heap, and
+none copies the input buffer, at any length.
+
+Measured with `GC.GetAllocatedBytesForCurrentThread` — a running total rather than a sample,
+so the figure is exact: **0 bytes**, at every length tried, for both engines and on both sides
+of the folding threshold, so the fold path and the pure-table path are each covered. The suite
+asserts this for all twelve presets and all six entry points; see
+[correctness](#correctness) for how.
+
+**No heap allocation**, because nothing on the path constructs a reference type:
+
+- The register is a `uint` threaded through by value — `Compute` is
+  `Finish(Append(InitialRegister, data))`, with no wrapper object, builder or state bag. This
+  is the payoff of the functional streaming API over a mutable accumulator type.
+- `ReadOnlySpan<T>` is a ref struct, so slicing it and reinterpreting it with
+  `MemoryMarshal.AsBytes` yields another struct on the stack, never a new buffer.
+- `foreach` over a span uses that span's struct enumerator, so there is no `IEnumerator` to
+  allocate.
+- The fold constants are `Vector128<T>` fields stored inline in the instance and loaded
+  straight into registers. Nothing boxes.
+
+The only allocation in the type is **per instance, in the constructor**: the 256-entry lookup
+table (1 KiB) and the object holding it. With a preset that has already happened in a static
+initializer, so `Crc32.Mpeg2.Compute(…)` allocates nothing whatsoever.
+
+**Zero-copy**, because blocks are consumed where they lie:
+
+- `FoldBlocks` takes a `ref byte` into the caller's buffer and loads 128 bits at a time with
+  `Vector128.LoadUnsafe`. Those loads are unaligned, so there is no alignment copy either.
+- The byte-order swap is not a pass over the data. In the fold path it *is* the `pshufb` the
+  block already goes through on its way into a register; in the tail it is a `bswap` on a word
+  already in a register. Neither writes to memory — which is the same point made under
+  [endianness](#a-note-on-endianness), and the reason never to pre-swap into a scratch array.
+- The input is `ReadOnlySpan<…>` throughout, so it is not mutated in place either.
+
+The one trap is at the **call site**, not in the library. Range-indexing an *array* copies;
+range-indexing a *span* does not:
+
+```csharp
+crc.ComputeLittleEndian(data[..1000]);           // allocates a 4 KiB uint[] copy
+crc.ComputeLittleEndian(data.AsSpan()[..1000]);  // free
+```
+
+This is pinned rather than merely observed: `Preset_WordEntryPoints_AllocateNothing` and
+`Preset_ByteEntryPoints_AllocateNothing` assert it for all twelve presets, so an edit that
+introduced a temporary buffer would fail the build — see [correctness](#correctness).
 
 ### Custom parameters
 
@@ -328,7 +379,7 @@ polynomials, initial values and final XORs before the implementation was written
 
 ## Correctness
 
-The test suite ([`CustomCrc32.Test`](CustomCrc32.Test/Crc32Tests.cs), NUnit, 252 tests) is
+The test suite ([`CustomCrc32.Test`](CustomCrc32.Test/Crc32Tests.cs), NUnit, 276 tests) is
 built on a single oracle: **Williams' model spelled out literally** — feed each byte in at
 the top of the register, clock it one bit at a time, reflect on the way in and out where
 asked. It is deliberately naive and structurally unlike the table-driven implementation, and
@@ -373,13 +424,23 @@ big-endian serialisation, on empty input, and over 400 random parameter sets. On
 `MemoryMarshal.Cast` relationship described above — on a little-endian host the cast agrees
 with `ComputeLittleEndian` and disagrees with `Compute` — so the trap stays documented.
 
+Twenty-four further tests check something no oracle can express: that the entry points
+**allocate nothing**. Each warms the JIT and the presets' static initialiser, then requires a
+further 128 calls to add exactly zero bytes to the thread's allocation total — across all
+twelve presets, all six entry points, lengths either side of the folding threshold, and byte
+lengths that leave a partial-word tail. `GC.GetAllocatedBytesForCurrentThread` is a running
+total rather than a sample, so the assertion is exact and there is no tolerance to tune. See
+[allocation and copying](#allocation-and-copying).
+
 Mutation checks confirm the suite is not vacuous. Dropping the `<< 1` from the reflected fold
 constant fails 50 tests; shifting the forward constant's exponent by one fails 36; flipping a
 bit of the polynomial fails 7. Removing the initial-value reversal fails exactly the two tests
 written for that gap, since — every preset having a palindromic initial value — nothing else
 can catch it. On the byte path: using the wrong block permutation fails 73, reading the tail
 words in the wrong byte order fails 31, and dropping the input byte from either engine's
-single-byte step fails 36 and 26.
+single-byte step fails 36 and 26. And a `data.ToArray()` slipped into `AppendLittleEndian` —
+a copy that moves no answer at all — fails the twelve word-allocation tests and **nothing
+else**, which is exactly the gap those tests exist to close.
 
 ## Benchmarks
 

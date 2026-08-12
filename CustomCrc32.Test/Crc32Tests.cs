@@ -497,6 +497,124 @@ public class Crc32Tests
             Is.Not.EqualTo(Crc32.Mpeg2.Compute([0x12345678])));
     }
 
+    // -------------------------------------------------------------- allocation
+
+    /// <summary>
+    /// Lengths that put both layers to work: below the folding threshold the table path
+    /// handles the whole input, above it the fold path does the bulk and leaves a tail.
+    /// </summary>
+    private static readonly int[] AllocationLengths = [0, 1, 7, 8, 9, 33, 129, 1023];
+
+    /// <summary>
+    /// Calls made before measuring. Enough to have JITted the method and run the static
+    /// initialiser that builds the presets, both of which allocate quite legitimately.
+    /// </summary>
+    private const int AllocationWarmupCalls = 256;
+
+    /// <summary>Calls the measurement spans. The counter is exact, so one stray byte fails.</summary>
+    private const int AllocationMeasuredCalls = 128;
+
+    /// <summary>
+    /// Keeps the measured call from being optimised away: a store to a static field cannot be
+    /// discarded, however dead the value is. Never read.
+    /// </summary>
+    private static uint _allocationSink;
+
+    /// <summary>
+    /// The word entry points must put nothing on the heap. The register is a bare
+    /// <see cref="uint"/> threaded through by value and the input span is read where it lies,
+    /// so a call has nothing legitimate to allocate. A scratch buffer for the byte swap, a
+    /// stray <c>ToArray</c>, or an interface-typed enumerator would each show up here and
+    /// nowhere else in this fixture, every other test of which only checks the answer.
+    /// </summary>
+    [TestCaseSource(nameof(Presets))]
+    public void Preset_WordEntryPoints_AllocateNothing(Preset preset)
+    {
+        Random random = new(31337);
+
+        foreach (int length in AllocationLengths)
+        {
+            uint[] data = RandomWords(random, length);
+            uint seed = preset.Instance.InitialRegister;
+
+            AssertAllocatesNothing(
+                $"{preset.Name}, Compute, {length} words",
+                () => preset.Instance.Compute(data));
+
+            AssertAllocatesNothing(
+                $"{preset.Name}, ComputeLittleEndian, {length} words",
+                () => preset.Instance.ComputeLittleEndian(data));
+
+            AssertAllocatesNothing(
+                $"{preset.Name}, Append, {length} words",
+                () => preset.Instance.Append(seed, data));
+
+            AssertAllocatesNothing(
+                $"{preset.Name}, AppendLittleEndian, {length} words",
+                () => preset.Instance.AppendLittleEndian(seed, data));
+        }
+    }
+
+    /// <summary>
+    /// The same of the byte entry points, at lengths that leave a partial word for the
+    /// single-byte tail loop as well as lengths that divide evenly.
+    /// </summary>
+    [TestCaseSource(nameof(Presets))]
+    public void Preset_ByteEntryPoints_AllocateNothing(Preset preset)
+    {
+        Random random = new(31337);
+
+        foreach (int words in AllocationLengths)
+        {
+            foreach (int length in new[] { words * sizeof(uint), (words * sizeof(uint)) + 3 })
+            {
+                byte[] data = RandomBytes(random, length);
+                uint seed = preset.Instance.InitialRegister;
+
+                AssertAllocatesNothing(
+                    $"{preset.Name}, ComputeBytes, {length} bytes",
+                    () => preset.Instance.ComputeBytes(data));
+
+                AssertAllocatesNothing(
+                    $"{preset.Name}, AppendBytes, {length} bytes",
+                    () => preset.Instance.AppendBytes(seed, data));
+            }
+        }
+    }
+
+    /// <summary>
+    /// Runs <paramref name="operation"/> until the JIT has settled, then requires a further
+    /// run of calls to add nothing whatsoever to this thread's allocation total.
+    /// </summary>
+    /// <remarks>
+    /// <see cref="GC.GetAllocatedBytesForCurrentThread"/> is a running total rather than a
+    /// sample, so the comparison is exact and wants no tolerance; it is also per-thread, so
+    /// nothing another test or a background thread does can leak into it. The delegate and
+    /// the closure behind it are allocated by the caller before this method is entered, and
+    /// invoking a delegate allocates nothing, so neither falls inside the measurement.
+    /// </remarks>
+    private static void AssertAllocatesNothing(string what, Func<uint> operation)
+    {
+        for (int i = 0; i < AllocationWarmupCalls; i++)
+        {
+            _allocationSink ^= operation();
+        }
+
+        long before = GC.GetAllocatedBytesForCurrentThread();
+
+        for (int i = 0; i < AllocationMeasuredCalls; i++)
+        {
+            _allocationSink ^= operation();
+        }
+
+        long allocated = GC.GetAllocatedBytesForCurrentThread() - before;
+
+        Assert.That(
+            allocated,
+            Is.Zero,
+            $"{what}: allocated {allocated} bytes over {AllocationMeasuredCalls} calls");
+    }
+
     // ------------------------------------------------------------- distinctness
 
     [Test]
