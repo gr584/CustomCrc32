@@ -194,6 +194,173 @@ public class Crc32Tests
         }
     }
 
+    // -------------------------------------------------------------- byte buffers
+
+    /// <summary>
+    /// The strongest test in the fixture, because it involves no oracle of mine at all. The
+    /// catalogue check value is defined as the CRC of the ASCII <em>bytes</em> 123456789, so
+    /// <see cref="Crc32.ComputeBytes"/> can be held directly against a published constant.
+    /// </summary>
+    [TestCaseSource(nameof(Presets))]
+    public void Preset_ComputeBytes_OverCheckString_ReturnsPublishedCheckValue(Preset preset)
+    {
+        Assert.That(preset.Instance.ComputeBytes("123456789"u8), Is.EqualTo(preset.CheckValue));
+    }
+
+    /// <summary>
+    /// Every length from empty to five blocks. This sweeps the sub-threshold case, the fold
+    /// threshold itself, whole and partial blocks, and all four possible byte tails.
+    /// </summary>
+    [TestCaseSource(nameof(Presets))]
+    public void Preset_ComputeBytes_MatchesReferenceModel(Preset preset)
+    {
+        Random random = new(31415926);
+
+        for (int length = 0; length <= 80; length++)
+        {
+            byte[] data = RandomBytes(random, length);
+
+            Assert.That(
+                preset.Instance.ComputeBytes(data),
+                Is.EqualTo(ReferenceModel(preset.Parameters, data)),
+                $"{preset.Name}, length {length}");
+        }
+    }
+
+    [TestCaseSource(nameof(Presets))]
+    public void Preset_ComputeBytes_LengthsAroundFoldingBoundaries_MatchReferenceModel(Preset preset)
+    {
+        Random random = new(2718281);
+
+        foreach (int length in (int[])[31, 32, 33, 63, 64, 65, 95, 96, 127, 128, 129, 255, 257, 511, 1021, 1022, 1023, 1024])
+        {
+            byte[] data = RandomBytes(random, length);
+
+            Assert.That(
+                preset.Instance.ComputeBytes(data),
+                Is.EqualTo(ReferenceModel(preset.Parameters, data)),
+                $"{preset.Name}, length {length}");
+        }
+    }
+
+    /// <summary>
+    /// The byte API's distinguishing property: a byte stream has no alignment, so it may be
+    /// split anywhere at all &mdash; including offsets that cut a word in half, which the
+    /// word-based overloads cannot express.
+    /// </summary>
+    [TestCaseSource(nameof(Presets))]
+    public void Preset_AppendBytes_ArbitrarySplitPoints_ProduceTheSameResult(Preset preset)
+    {
+        byte[] data = RandomBytes(new Random(8675309), 300);
+        uint expected = preset.Instance.ComputeBytes(data);
+
+        for (int split = 0; split <= data.Length; split++)
+        {
+            uint register = preset.Instance.AppendBytes(preset.Instance.InitialRegister, data[..split]);
+            register = preset.Instance.AppendBytes(register, data[split..]);
+
+            Assert.That(preset.Instance.Finish(register), Is.EqualTo(expected), $"{preset.Name}, split at {split}");
+        }
+    }
+
+    /// <summary>
+    /// Pits the folded byte path against the byte-at-a-time one. Appending a single byte per
+    /// call stays far below the folding threshold and exercises only the tail loop, so this
+    /// catches a tail step that disagrees with the vectorised bulk.
+    /// </summary>
+    [TestCaseSource(nameof(Presets))]
+    public void Preset_FoldedBytes_MatchByteAtATimeAppend(Preset preset)
+    {
+        byte[] data = RandomBytes(new Random(4815162), 1029);
+
+        uint register = preset.Instance.InitialRegister;
+        foreach (byte value in data)
+        {
+            register = preset.Instance.AppendBytes(register, [value]);
+        }
+
+        Assert.That(preset.Instance.Finish(register), Is.EqualTo(preset.Instance.ComputeBytes(data)));
+    }
+
+    /// <summary>
+    /// Ties the new API to the already-verified one: over a whole number of words, checksumming
+    /// the big-endian serialisation byte by byte is by definition the same job as
+    /// <see cref="Crc32.Compute"/>.
+    /// </summary>
+    [TestCaseSource(nameof(Presets))]
+    public void Preset_ComputeBytes_OverBigEndianSerialisation_EqualsCompute(Preset preset)
+    {
+        Random random = new(161803);
+
+        for (int length = 0; length <= 40; length++)
+        {
+            uint[] words = RandomWords(random, length);
+
+            Assert.That(
+                preset.Instance.ComputeBytes(ToBigEndianBytes(words)),
+                Is.EqualTo(preset.Instance.Compute(words)),
+                $"{preset.Name}, length {length}");
+        }
+    }
+
+    /// <summary>
+    /// Pins the exact relationship the documentation warns about. Reinterpreting a byte buffer
+    /// as words reads each group of four in the host's order, so on a little-endian host it is
+    /// the <em>little-endian</em> overload that reproduces the byte-order CRC &mdash; and the
+    /// big-endian one that quietly does not. That host-dependence is precisely why
+    /// <see cref="Crc32.ComputeBytes"/> exists.
+    /// </summary>
+    [TestCaseSource(nameof(Presets))]
+    public void Preset_ComputeBytes_EqualsReinterpretedWords_OnALittleEndianHost(Preset preset)
+    {
+        Assert.That(BitConverter.IsLittleEndian, Is.True, "this test describes little-endian hosts only");
+
+        byte[] data = RandomBytes(new Random(112358), 256);
+        ReadOnlySpan<uint> reinterpreted = System.Runtime.InteropServices.MemoryMarshal.Cast<byte, uint>(data);
+
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(preset.Instance.ComputeBytes(data), Is.EqualTo(preset.Instance.ComputeLittleEndian(reinterpreted)));
+            Assert.That(preset.Instance.ComputeBytes(data), Is.Not.EqualTo(preset.Instance.Compute(reinterpreted)));
+        }
+    }
+
+    [TestCaseSource(nameof(Presets))]
+    public void Preset_ComputeBytes_EmptyInput_EqualsFinishOfInitialRegister(Preset preset)
+    {
+        Assert.That(
+            preset.Instance.ComputeBytes(ReadOnlySpan<byte>.Empty),
+            Is.EqualTo(preset.Instance.Finish(preset.Instance.InitialRegister)));
+    }
+
+    /// <summary>
+    /// Random parameter sets over random byte lengths. As with the word API, this is what
+    /// covers mismatched input and output reflection, which no preset exercises.
+    /// </summary>
+    [Test]
+    public void ArbitraryParameters_ComputeBytes_MatchReferenceModel()
+    {
+        Random random = new(20260811);
+
+        for (int trial = 0; trial < 400; trial++)
+        {
+            Crc32Parameters parameters = new(
+                Polynomial: RandomWord(random),
+                InitialValue: RandomWord(random),
+                ReflectInput: random.Next(2) == 0,
+                ReflectOutput: random.Next(2) == 0,
+                XorOut: RandomWord(random));
+
+            // Spans both sides of the 32-byte folding threshold and every tail remainder.
+            byte[] data = RandomBytes(random, random.Next(0, 200));
+
+            Assert.That(
+                new Crc32(parameters).ComputeBytes(data),
+                Is.EqualTo(ReferenceModel(parameters, data)),
+                $"{parameters} over {data.Length} bytes");
+        }
+    }
+
     // ------------------------------------------------------- arbitrary parameters
 
     /// <summary>
@@ -402,6 +569,14 @@ public class Crc32Tests
 
     private static uint RandomWord(Random random) =>
         (uint)random.NextInt64(uint.MinValue, (long)uint.MaxValue + 1);
+
+    private static byte[] RandomBytes(Random random, int length)
+    {
+        byte[] data = new byte[length];
+        random.NextBytes(data);
+
+        return data;
+    }
 
     private static uint[] RandomWords(Random random, int length)
     {

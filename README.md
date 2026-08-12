@@ -16,6 +16,9 @@ uint[] words = [0x12345678, 0x9ABCDEF0];
 
 uint crc = Crc32.Mpeg2.Compute(words);      // 0x7D24A31B
 uint zlib = Crc32.IsoHdlc.Compute(words);   // the usual "CRC-32"
+
+// Data that is really bytes rather than words has its own entry point, taking any length.
+uint ofFile = Crc32.IsoHdlc.ComputeBytes(File.ReadAllBytes("payload.bin"));
 ```
 
 ## Requirements
@@ -74,13 +77,17 @@ public sealed class Crc32
     public Crc32Parameters Parameters { get; }
     public uint InitialRegister { get; }
 
-    // One-shot. The suffix selects the byte order the words are serialised in.
+    // One-shot over words. The suffix selects the byte order the words are serialised in.
     public uint Compute(ReadOnlySpan<uint> data);
     public uint ComputeLittleEndian(ReadOnlySpan<uint> data);
+
+    // One-shot over bytes. Any length; no byte order to choose.
+    public uint ComputeBytes(ReadOnlySpan<byte> data);
 
     // Streaming.
     public uint Append(uint register, ReadOnlySpan<uint> data);
     public uint AppendLittleEndian(uint register, ReadOnlySpan<uint> data);
+    public uint AppendBytes(uint register, ReadOnlySpan<byte> data);
     public uint Finish(uint register);
 }
 ```
@@ -91,6 +98,11 @@ presets are shared instances, so `Crc32.Mpeg2.Compute(…)` allocates nothing.
 
 The input parameter is `ReadOnlySpan<uint>`, so a `Span<uint>`, a `uint[]`, a stack-allocated
 buffer or a collection expression all bind without a cast.
+
+**Which entry point:** if your data is genuinely *words* — values you hold as `uint` and are
+choosing a serialisation for — use `Compute` or `ComputeLittleEndian`. If it is genuinely
+*bytes* — a file, a packet, a wire message — use `ComputeBytes`. The distinction is not
+cosmetic; see [endianness](#a-note-on-endianness) below.
 
 ### Custom parameters
 
@@ -145,18 +157,45 @@ the incoming word rather than on the CRC register, so it carries no dependency o
 previous iteration and costs nothing measurable — see the benchmarks below. Never pre-swap
 the buffer with `BinaryPrimitives.ReverseEndianness`; that allocates and adds a pass.
 
-### The one case this does not cover
+### When the data is really bytes
 
-If your data actually arrives as a **byte** buffer that you are reinterpreting as `uint` (via
-`MemoryMarshal.Cast` or similar), neither method is the right tool, and the cast is a trap: a
-big-endian buffer `12 34 56 78` read through `MemoryMarshal.Cast<byte, uint>` on a
-little-endian host yields `0x78563412` — silently the wrong word, no error, wrong CRC.
+If your data arrives as a **byte** buffer, use `ComputeBytes` and stop thinking about byte
+order — a byte buffer already carries its own.
 
-The correct fix is not to cast at all but to process bytes directly, which also handles
-lengths that are not a multiple of four. No byte-oriented overload ships today — ask if you
-need one. It would want a distinct name (`ComputeBytes`) rather than an overload, because
-overloading on `ReadOnlySpan<byte>` alongside `ReadOnlySpan<uint>` makes collection-expression
-calls like `Compute([])` ambiguous.
+```csharp
+byte[] packet = File.ReadAllBytes("payload.bin");
+
+uint crc = Crc32.IsoHdlc.ComputeBytes(packet);        // the usual "CRC-32" of a file
+uint check = Crc32.Mpeg2.ComputeBytes("123456789"u8); // 0x0376E6E7, the catalogue check value
+```
+
+Any length works, including lengths that are not a multiple of four, and a stream may be
+split **anywhere** — `AppendBytes` has no alignment to respect, unlike the word overloads:
+
+```csharp
+uint register = crc32.InitialRegister;
+while (TryReadChunk(out ReadOnlySpan<byte> chunk))   // chunks of any size, even 1 byte
+{
+    register = crc32.AppendBytes(register, chunk);
+}
+uint crc = crc32.Finish(register);
+```
+
+**Do not reinterpret the buffer as `uint` instead.** `MemoryMarshal.Cast<byte, uint>` reads
+each group of four bytes in the *host's* order, so the buffer `12 34 56 78` becomes
+`0x78563412` on a little-endian machine and `0x12345678` on a big-endian one — silently a
+different answer per platform, no error, and a trailing partial word cannot be represented at
+all. Concretely, on a little-endian host the cast happens to line up with
+`ComputeLittleEndian` and *not* with `Compute`, which is exactly the kind of accident that
+survives testing on one architecture and fails on another. There is a test pinning that
+relationship so the trap stays documented rather than rediscovered.
+
+`ComputeBytes` is deliberately **not** an overload of `Compute`: overloading on
+`ReadOnlySpan<byte>` alongside `ReadOnlySpan<uint>` would make collection-expression calls
+like `Compute([])` ambiguous.
+
+Performance is unaffected by the choice — the byte path folds through the same accelerated
+kernel and runs at the same throughput, with 0–15 trailing bytes finished by the table.
 
 ## Implementation notes
 
@@ -261,7 +300,7 @@ polynomials, initial values and final XORs before the implementation was written
 
 ## Correctness
 
-The test suite ([`CustomCrc32.Test`](CustomCrc32.Test/Crc32Tests.cs), NUnit, 155 tests) is
+The test suite ([`CustomCrc32.Test`](CustomCrc32.Test/Crc32Tests.cs), NUnit, 252 tests) is
 built on a single oracle: **Williams' model spelled out literally** — feed each byte in at
 the top of the register, clock it one bit at a time, reflect on the way in and out where
 asked. It is deliberately naive and structurally unlike the table-driven implementation, and
@@ -297,11 +336,22 @@ Everything else is then checked against the oracle:
 - The fifteen MPEG-2 values this library produced before `Crc32Parameters` existed still
   hold, so the migration is known not to have moved any answers.
 
+The byte path adds a stronger anchor than any of these, because it needs no oracle at all:
+`ComputeBytes("123456789"u8)` is held directly against the twelve published check values,
+which are *defined* over bytes. Beyond that it is checked at every length from 0 to 80 bytes
+and around the larger fold boundaries, split at **every** one of 300 byte offsets rather than
+on word boundaries, against byte-at-a-time appending, against `Compute` over the same
+big-endian serialisation, and over 400 random parameter sets. One further test pins the
+`MemoryMarshal.Cast` relationship described above — on a little-endian host the cast agrees
+with `ComputeLittleEndian` and disagrees with `Compute` — so the trap stays documented.
+
 Mutation checks confirm the suite is not vacuous. Dropping the `<< 1` from the reflected fold
 constant fails 50 tests; shifting the forward constant's exponent by one fails 36; flipping a
 bit of the polynomial fails 7. Removing the initial-value reversal fails exactly the two tests
 written for that gap, since — every preset having a palindromic initial value — nothing else
-can catch it.
+can catch it. On the byte path: using the wrong block permutation fails 73, reading the tail
+words in the wrong byte order fails 31, and dropping the input byte from either engine's
+single-byte step fails 36 and 26.
 
 ## Benchmarks
 
@@ -311,7 +361,9 @@ across input sizes chosen to sit at different levels of the memory hierarchy. Th
 baselines are reimplemented inside the benchmark rather than called through the library,
 since the library now folds automatically and there is no supported way to ask it not to.
 `GlobalSetup` throws if any two paths that should agree have diverged — a speed comparison
-stops meaning anything once the baseline is wrong.
+stops meaning anything once the baseline is wrong. That check covers `ComputeBytes` too: the
+byte buffer holds the big-endian serialisation of the same words, so it must return what
+`Compute` does.
 
 `ThroughputColumn` is a custom `IColumn` adding a GB/s column derived from the mean and the
 `WordCount` parameter. BenchmarkDotNet has no built-in throughput column, and
@@ -359,6 +411,28 @@ only reduces the accumulator and mops up the tail.
 the loaded block rather than a `bswap` on a word, but the reasoning is unchanged — it does
 not sit on the accumulator's dependency chain.
 
+#### `ComputeBytes` costs nothing extra
+
+Taken as a **separate run** from the table above, so read the columns against each other and
+not against the figures above — a short job varies by about 10% between runs, and this one
+happened to land faster across the board.
+
+| WordCount        | Fold fwd BE | Fold fwd bytes | Fold refl BE | Fold refl bytes |
+| ---------------- | ----------- | -------------- | ------------ | --------------- |
+| 16 (64 B)        | 2.67 GB/s   | 2.48 GB/s      | 2.87 GB/s    | 2.66 GB/s       |
+| 256 (1 KiB)      | 15.2 GB/s   | 15.2 GB/s      | 16.1 GB/s    | 16.5 GB/s       |
+| 4,096 (16 KiB)   | 23.7 GB/s   | 23.9 GB/s      | 23.8 GB/s    | 23.9 GB/s       |
+| 65,536 (256 KiB) | 23.9 GB/s   | 23.7 GB/s      | 24.2 GB/s    | 24.5 GB/s       |
+| 262,144 (1 MiB)  | 23.1 GB/s   | 23.5 GB/s      | 22.8 GB/s    | 23.5 GB/s       |
+
+From 1 KiB up the byte path is level with the word path — within ±3%, which is inside the
+run-to-run spread of a short job. That is the expected result: the same fold kernel over the
+same bytes, differing only in the permutation constant it is handed.
+
+The 64-byte row looks like a 7% deficit but should not be read that way. At a ~24 ns mean the
+short job reports a 99.9% confidence interval of ±7 to ±14 ns, so that column says nothing
+either way; it is there for completeness, not as a finding.
+
 ### Going further
 
 Nothing here is the ceiling.
@@ -374,7 +448,10 @@ parameter set, a special case for one preset did not seem worth the branch.
 
 The `pshufb` on each load could be skipped in the reflected little-endian case, where the
 permutation is the identity. On this microarchitecture shuffles and carry-less multiplies
-compete for the same port, so it may be worth a little; it was left in for simplicity.
+compete for the same port, so it may be worth a little; it was left in for simplicity. Note
+that this case is more common than it first looks: `ComputeBytes` uses the little-endian
+permutation too, so every reflected preset — `IsoHdlc` and `Castagnoli` included — takes the
+identity shuffle when checksumming a byte buffer.
 
 ## Project layout
 

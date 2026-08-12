@@ -25,6 +25,11 @@ namespace CustomCrc32;
 /// <see cref="ComputeLittleEndian(ReadOnlySpan{uint})"/> select the byte order the words are
 /// treated as being <em>serialised</em> in, and return the same answer on every platform.
 /// </para>
+/// <para>
+/// Data that is genuinely a byte buffer rather than words belongs in
+/// <see cref="ComputeBytes(ReadOnlySpan{byte})"/>, which takes any length and has no byte
+/// order to choose.
+/// </para>
 /// </remarks>
 public sealed class Crc32
 {
@@ -43,15 +48,18 @@ public sealed class Crc32
 
     private readonly uint _xorOut;
 
+    /// <summary>Bytes in one 128-bit fold block.</summary>
+    private const int BytesPerBlock = 16;
+
     /// <summary>Words in one 128-bit fold block.</summary>
-    private const int WordsPerBlock = 4;
+    private const int WordsPerBlock = BytesPerBlock / sizeof(uint);
 
     /// <summary>
-    /// Shortest input worth folding. A single block gains nothing, because reducing the
-    /// accumulator costs the same four word-folds the table path would have done anyway;
+    /// Shortest input worth folding, in blocks. A single block gains nothing, because reducing
+    /// the accumulator costs the same four word-folds the table path would have done anyway;
     /// from two blocks up, folding wins and keeps widening. Measured crossover, not a guess.
     /// </summary>
-    private const int FoldingThreshold = 2 * WordsPerBlock;
+    private const int FoldingThreshold = 2;
 
     /// <summary>True when this machine has the carry-less multiply and shuffle instructions.</summary>
     private readonly bool _canFold;
@@ -162,10 +170,10 @@ public sealed class Crc32
     /// <returns>The updated register state, which is not yet a CRC.</returns>
     public uint Append(uint register, ReadOnlySpan<uint> data)
     {
-        if (_canFold && data.Length >= FoldingThreshold)
+        if (_canFold && data.Length >= FoldingThreshold * WordsPerBlock)
         {
             int folded = data.Length / WordsPerBlock * WordsPerBlock;
-            register = FoldBlocks(register, data[..folded], _bigEndianShuffle);
+            register = FoldBlocks(register, MemoryMarshal.AsBytes(data[..folded]), _bigEndianShuffle);
             data = data[folded..];
         }
 
@@ -199,10 +207,10 @@ public sealed class Crc32
     /// <returns>The updated register state, which is not yet a CRC.</returns>
     public uint AppendLittleEndian(uint register, ReadOnlySpan<uint> data)
     {
-        if (_canFold && data.Length >= FoldingThreshold)
+        if (_canFold && data.Length >= FoldingThreshold * WordsPerBlock)
         {
             int folded = data.Length / WordsPerBlock * WordsPerBlock;
-            register = FoldBlocks(register, data[..folded], _littleEndianShuffle);
+            register = FoldBlocks(register, MemoryMarshal.AsBytes(data[..folded]), _littleEndianShuffle);
             data = data[folded..];
         }
 
@@ -218,6 +226,91 @@ public sealed class Crc32
             foreach (uint word in data)
             {
                 register = FoldForward(register, BinaryPrimitives.ReverseEndianness(word));
+            }
+        }
+
+        return register;
+    }
+
+    /// <summary>
+    /// Computes the CRC of a byte buffer, consuming the bytes in the order they appear.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Use this when the data really is bytes &mdash; a file, a packet, a wire message &mdash;
+    /// rather than words you happen to be serialising. There is no endianness choice to make,
+    /// because a byte buffer already carries its own order, and no length restriction: any
+    /// length works, including lengths that are not a multiple of four.
+    /// </para>
+    /// <para>
+    /// In particular, prefer this over casting a byte buffer to <c>ReadOnlySpan&lt;uint&gt;</c>
+    /// with <see cref="MemoryMarshal.Cast{TFrom,TTo}(ReadOnlySpan{TFrom})"/> and calling
+    /// <see cref="Compute(ReadOnlySpan{uint})"/>. That cast reads each group of four bytes in
+    /// the host's byte order, so it silently produces a different answer on a big-endian
+    /// machine than on a little-endian one, and it cannot represent a trailing partial word
+    /// at all.
+    /// </para>
+    /// <para>
+    /// This is deliberately not an overload of <see cref="Compute(ReadOnlySpan{uint})"/>:
+    /// overloading on both span element types would make collection-expression calls such as
+    /// <c>Compute([])</c> ambiguous.
+    /// </para>
+    /// </remarks>
+    public uint ComputeBytes(ReadOnlySpan<byte> data) => Finish(AppendBytes(InitialRegister, data));
+
+    /// <summary>
+    /// Folds a further run of bytes into a running register, so a byte stream can be
+    /// checksummed in pieces.
+    /// </summary>
+    /// <param name="register">The running register state.</param>
+    /// <param name="data">The bytes to fold in, consumed in the order they appear.</param>
+    /// <returns>The updated register state, which is not yet a CRC.</returns>
+    /// <remarks>
+    /// Chunks may be split at any offset. Unlike the word-based overloads there is no
+    /// alignment to respect, so splitting a buffer anywhere and appending the pieces in order
+    /// gives the same register as appending it whole.
+    /// </remarks>
+    public uint AppendBytes(uint register, ReadOnlySpan<byte> data)
+    {
+        // A block loaded from a byte buffer is already in message order, which is what the
+        // little-endian shuffle produces: serialising little-endian words that were themselves
+        // read little-endian from memory reproduces the underlying byte order. So this is the
+        // right permutation here for both engines, despite the name.
+        if (_canFold && data.Length >= FoldingThreshold * BytesPerBlock)
+        {
+            int folded = data.Length / BytesPerBlock * BytesPerBlock;
+            register = FoldBlocks(register, data[..folded], _littleEndianShuffle);
+            data = data[folded..];
+        }
+
+        // Whole words first, so the tail costs four lookups per word rather than per byte —
+        // which matters most on a machine that cannot fold and runs the entire input here.
+        // The word must present the earliest byte to the end of the register the engine
+        // consumes from: the top for a forward engine, the bottom for a reflected one.
+        if (_reflectInput)
+        {
+            while (data.Length >= sizeof(uint))
+            {
+                register = FoldReflected(register, BinaryPrimitives.ReadUInt32LittleEndian(data));
+                data = data[sizeof(uint)..];
+            }
+
+            foreach (byte value in data)
+            {
+                register = (register >> 8) ^ _table[(register ^ value) & 0xFF];
+            }
+        }
+        else
+        {
+            while (data.Length >= sizeof(uint))
+            {
+                register = FoldForward(register, BinaryPrimitives.ReadUInt32BigEndian(data));
+                data = data[sizeof(uint)..];
+            }
+
+            foreach (byte value in data)
+            {
+                register = (register << 8) ^ _table[(register >> 24) ^ value];
             }
         }
 
@@ -275,10 +368,10 @@ public sealed class Crc32
     /// independent accumulators run at once so the multiply's latency overlaps rather than
     /// stalling a single chain.
     /// </remarks>
-    private uint FoldBlocks(uint register, ReadOnlySpan<uint> data, Vector128<byte> shuffle)
+    private uint FoldBlocks(uint register, ReadOnlySpan<byte> data, Vector128<byte> shuffle)
     {
-        ref uint source = ref MemoryMarshal.GetReference(data);
-        int blocks = data.Length / WordsPerBlock;
+        ref byte source = ref MemoryMarshal.GetReference(data);
+        int blocks = data.Length / BytesPerBlock;
 
         // The incoming register enters where the engine keeps it: at the bottom of the
         // accumulator when reflected, at the top when forward.
@@ -317,9 +410,9 @@ public sealed class Crc32
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static Vector128<ulong> LoadBlock(ref uint source, int block, Vector128<byte> shuffle) =>
+    private static Vector128<ulong> LoadBlock(ref byte source, int block, Vector128<byte> shuffle) =>
         Ssse3.Shuffle(
-            Vector128.LoadUnsafe(ref source, (nuint)(block * WordsPerBlock)).AsByte(),
+            Vector128.LoadUnsafe(ref source, (nuint)(block * BytesPerBlock)),
             shuffle).AsUInt64();
 
     /// <summary>

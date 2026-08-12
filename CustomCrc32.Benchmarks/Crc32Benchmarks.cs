@@ -20,6 +20,7 @@ public class Crc32Benchmarks
     public int WordCount { get; set; }
 
     private uint[] _data = [];
+    private byte[] _bytes = [];
     private uint[] _forwardTable = [];
     private uint[] _reflectedTable = [];
 
@@ -34,6 +35,14 @@ public class Crc32Benchmarks
             _data[i] = (uint)random.NextInt64(uint.MinValue, (long)uint.MaxValue + 1);
         }
 
+        // The big-endian serialisation of the same words, so the byte path is checksumming
+        // exactly the message Compute is and the two must return the same value.
+        _bytes = new byte[_data.Length * sizeof(uint)];
+        for (int i = 0; i < _data.Length; i++)
+        {
+            BinaryPrimitives.WriteUInt32BigEndian(_bytes.AsSpan(i * sizeof(uint)), _data[i]);
+        }
+
         _forwardTable = BuildTable(Crc32Parameters.Mpeg2.Polynomial, reflected: false);
         _reflectedTable = BuildTable(Crc32Parameters.IsoHdlc.Polynomial, reflected: true);
 
@@ -46,6 +55,9 @@ public class Crc32Benchmarks
         BinaryPrimitives.ReverseEndianness(_data, swapped);
         Verify("forward byte-order identity", FoldedForwardLittleEndian(), Crc32.Mpeg2.Compute(swapped));
         Verify("reflected byte-order identity", FoldedReflectedLittleEndian(), Crc32.IsoHdlc.Compute(swapped));
+
+        Verify("forward bytes vs words", FoldedForwardBytes(), FoldedForward());
+        Verify("reflected bytes vs words", FoldedReflectedBytes(), FoldedReflected());
     }
 
     private void Verify(string what, uint actual, uint expected)
@@ -149,4 +161,15 @@ public class Crc32Benchmarks
 
     [Benchmark(Description = "Folded reflected LE")]
     public uint FoldedReflectedLittleEndian() => Crc32.IsoHdlc.ComputeLittleEndian(_data);
+
+    /// <summary>
+    /// The byte-buffer entry point over the same message. Reads the same number of bytes
+    /// through the same fold kernel, so it should land on the word paths; the point of
+    /// measuring is to confirm that rather than assume it.
+    /// </summary>
+    [Benchmark(Description = "Folded forward bytes")]
+    public uint FoldedForwardBytes() => Crc32.Mpeg2.ComputeBytes(_bytes);
+
+    [Benchmark(Description = "Folded reflected bytes")]
+    public uint FoldedReflectedBytes() => Crc32.IsoHdlc.ComputeBytes(_bytes);
 }
