@@ -1,3 +1,6 @@
+using System.Buffers.Binary;
+using System.Runtime.CompilerServices;
+
 namespace CustomCrc32;
 
 /// <summary>
@@ -53,18 +56,65 @@ public static class Crc32
 
         foreach (uint word in data)
         {
-            // Fold the whole word in at once, then clock the register through the 32
-            // rounds it owes, a byte per lookup. Folding first and shifting afterwards
-            // is what makes this equivalent to feeding the word's four bytes in
-            // descending significance.
-            crc ^= word;
-            crc = (crc << 8) ^ Table[crc >> 24];
-            crc = (crc << 8) ^ Table[crc >> 24];
-            crc = (crc << 8) ^ Table[crc >> 24];
-            crc = (crc << 8) ^ Table[crc >> 24];
+            crc = Fold(crc, word);
         }
 
         return crc ^ XorOut;
+    }
+
+    /// <summary>
+    /// Computes the CRC of the <em>little-endian</em> serialisation of
+    /// <paramref name="data"/>: each word contributes its least significant byte first,
+    /// so 0x12345678 is checksummed as the bytes 78 56 34 12.
+    /// </summary>
+    /// <remarks>
+    /// Use this when the words are values you intend to write out least significant byte
+    /// first. It is exactly <see cref="Compute(ReadOnlySpan{uint})"/> over the same words
+    /// byte-swapped, but performs the swap a word at a time rather than materialising a
+    /// reversed copy of the input.
+    /// </remarks>
+    /// <param name="data">The words to checksum, each consumed least significant byte first.</param>
+    /// <returns>The CRC, or <see cref="InitialValue"/> when <paramref name="data"/> is empty.</returns>
+    public static uint ComputeLittleEndian(ReadOnlySpan<uint> data) =>
+        ComputeLittleEndian(data, InitialValue);
+
+    /// <summary>
+    /// Continues a little-endian CRC over a further run of words. The counterpart to
+    /// <see cref="Compute(ReadOnlySpan{uint}, uint)"/>, and chains the same way.
+    /// </summary>
+    /// <param name="data">The words to checksum, each consumed least significant byte first.</param>
+    /// <param name="seed">The register state to resume from, normally a previous return value.</param>
+    /// <returns>The CRC of everything folded in so far.</returns>
+    public static uint ComputeLittleEndian(ReadOnlySpan<uint> data, uint seed)
+    {
+        uint crc = seed;
+
+        foreach (uint word in data)
+        {
+            // The byte swap acts on the incoming word rather than on the register, so it
+            // sits off the dependency chain the four lookups form and overlaps with them.
+            crc = Fold(crc, BinaryPrimitives.ReverseEndianness(word));
+        }
+
+        return crc ^ XorOut;
+    }
+
+    /// <summary>
+    /// Folds one word into the register: XOR the whole word in, then clock the register
+    /// through the 32 rounds it owes, a byte per lookup. Folding first and shifting
+    /// afterwards is what makes this equivalent to feeding the word's four bytes in
+    /// descending significance.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static uint Fold(uint crc, uint word)
+    {
+        crc ^= word;
+        crc = (crc << 8) ^ Table[crc >> 24];
+        crc = (crc << 8) ^ Table[crc >> 24];
+        crc = (crc << 8) ^ Table[crc >> 24];
+        crc = (crc << 8) ^ Table[crc >> 24];
+
+        return crc;
     }
 
     private static uint[] BuildTable()

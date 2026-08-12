@@ -1,3 +1,4 @@
+using System.Buffers.Binary;
 using BenchmarkDotNet.Attributes;
 
 namespace CustomCrc32.Benchmarks;
@@ -42,6 +43,18 @@ public class Crc32Benchmarks
             throw new InvalidOperationException(
                 $"Implementations disagree at {WordCount} words: bitwise 0x{bitwise:X8}, table-driven 0x{tableDriven:X8}.");
         }
+
+        // The little-endian path must agree with the big-endian one over swapped input.
+        uint[] swapped = new uint[_data.Length];
+        BinaryPrimitives.ReverseEndianness(_data, swapped);
+
+        uint littleEndian = TableDrivenLittleEndian();
+        uint expected = Crc32.Compute(swapped);
+        if (littleEndian != expected)
+        {
+            throw new InvalidOperationException(
+                $"Little-endian path disagrees at {WordCount} words: got 0x{littleEndian:X8}, expected 0x{expected:X8}.");
+        }
     }
 
     /// <summary>
@@ -67,6 +80,13 @@ public class Crc32Benchmarks
     }
 
     /// <summary>The shipping implementation: one table lookup per byte.</summary>
-    [Benchmark(Description = "Table-driven")]
+    [Benchmark(Description = "Table-driven (BE)")]
     public uint TableDriven() => Crc32.Compute(_data);
+
+    /// <summary>
+    /// The same, over the little-endian serialisation of the words. The difference against
+    /// <see cref="TableDriven"/> is the cost of the per-word byte swap.
+    /// </summary>
+    [Benchmark(Description = "Table-driven (LE)")]
+    public uint TableDrivenLittleEndian() => Crc32.ComputeLittleEndian(_data);
 }
