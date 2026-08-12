@@ -1,0 +1,6 @@
+<Solution>
+  <Project Path="CustomCrc32.Test/CustomCrc32.Test.csproj" Id="a481c994-e130-419b-8f2b-7389422f47da">
+    <BuildDependency Project="CustomCrc32/CustomCrc32.csproj" />
+  </Project>
+  <Project Path="CustomCrc32/CustomCrc32.csproj" />
+</Solution>
