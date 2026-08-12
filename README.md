@@ -378,6 +378,7 @@ compete for the same port, so it may be worth a little; it was left in for simpl
 
 ```
 CustomCrc32.slnx                  Solution (new-style XML format)
+├── .github/workflows/ci.yml      Build and test on every push and pull request
 ├── CustomCrc32/                  Class library — the implementation
 │   ├── Crc32.cs                  Engines, folding, presets, streaming API
 │   └── Crc32Parameters.cs        Parameter model and preset values
