@@ -1,5 +1,7 @@
 # CustomCrc32
 
+[![Build and test](https://github.com/gr584/CustomCrc32/actions/workflows/ci.yml/badge.svg)](https://github.com/gr584/CustomCrc32/actions/workflows/ci.yml)
+
 A configurable 32-bit CRC for input arriving as **32-bit words** rather than bytes. Any
 parameter set expressible in the Rocksoft/Williams model works, including reflected variants,
 and twelve catalogued CRC-32s ship as named presets.

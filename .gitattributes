@@ -1,0 +1,11 @@
+# Normalise line endings to LF in the repository, checking out whatever is native to
+# the working platform. Without this the result depends on each clone's core.autocrlf,
+# and one contributor with it turned off produces a diff touching every line.
+* text=auto
+
+# Give diffs of C# files a hunk header naming the enclosing member.
+*.cs text diff=csharp
+
+# Consumed by Linux runners; keep LF in the working tree too, not just the index.
+*.yml text eol=lf
+*.yaml text eol=lf
