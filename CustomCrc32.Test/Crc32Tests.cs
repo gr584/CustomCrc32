@@ -59,7 +59,7 @@ public class Crc32Tests
             uint[] data = RandomWords(random, length);
 
             Assert.That(
-                preset.Instance.Compute(data),
+                preset.Instance.ComputeBigEndian(data),
                 Is.EqualTo(ReferenceModel(preset.Parameters, ToBigEndianBytes(data))),
                 $"{preset.Name}, length {length}");
         }
@@ -85,7 +85,7 @@ public class Crc32Tests
     public void Preset_EmptyInput_EqualsFinishOfInitialRegister(Preset preset)
     {
         Assert.That(
-            preset.Instance.Compute([]),
+            preset.Instance.ComputeBigEndian([]),
             Is.EqualTo(preset.Instance.Finish(preset.Instance.InitialRegister)));
     }
 
@@ -97,10 +97,10 @@ public class Crc32Tests
         uint register = preset.Instance.InitialRegister;
         foreach (uint[] chunk in new[] { data[..7], data[7..7], data[7..20], data[20..] })
         {
-            register = preset.Instance.Append(register, chunk);
+            register = preset.Instance.AppendBigEndian(register, chunk);
         }
 
-        Assert.That(preset.Instance.Finish(register), Is.EqualTo(preset.Instance.Compute(data)));
+        Assert.That(preset.Instance.Finish(register), Is.EqualTo(preset.Instance.ComputeBigEndian(data)));
     }
 
     [TestCaseSource(nameof(Presets))]
@@ -139,7 +139,7 @@ public class Crc32Tests
             uint[] data = RandomWords(random, length);
 
             Assert.That(
-                preset.Instance.Compute(data),
+                preset.Instance.ComputeBigEndian(data),
                 Is.EqualTo(ReferenceModel(preset.Parameters, ToBigEndianBytes(data))),
                 $"{preset.Name}, big-endian, length {length}");
 
@@ -164,13 +164,13 @@ public class Crc32Tests
         uint littleEndian = preset.Instance.InitialRegister;
         foreach (uint word in data)
         {
-            bigEndian = preset.Instance.Append(bigEndian, [word]);
+            bigEndian = preset.Instance.AppendBigEndian(bigEndian, [word]);
             littleEndian = preset.Instance.AppendLittleEndian(littleEndian, [word]);
         }
 
         using (Assert.EnterMultipleScope())
         {
-            Assert.That(preset.Instance.Finish(bigEndian), Is.EqualTo(preset.Instance.Compute(data)));
+            Assert.That(preset.Instance.Finish(bigEndian), Is.EqualTo(preset.Instance.ComputeBigEndian(data)));
             Assert.That(preset.Instance.Finish(littleEndian), Is.EqualTo(preset.Instance.ComputeLittleEndian(data)));
         }
     }
@@ -183,12 +183,12 @@ public class Crc32Tests
     public void Preset_ArbitrarySplitPoints_ProduceTheSameResult(Preset preset)
     {
         uint[] data = RandomWords(new Random(90210), 300);
-        uint expected = preset.Instance.Compute(data);
+        uint expected = preset.Instance.ComputeBigEndian(data);
 
         for (int split = 0; split <= data.Length; split += 7)
         {
-            uint register = preset.Instance.Append(preset.Instance.InitialRegister, data[..split]);
-            register = preset.Instance.Append(register, data[split..]);
+            uint register = preset.Instance.AppendBigEndian(preset.Instance.InitialRegister, data[..split]);
+            register = preset.Instance.AppendBigEndian(register, data[split..]);
 
             Assert.That(preset.Instance.Finish(register), Is.EqualTo(expected), $"{preset.Name}, split at {split}");
         }
@@ -285,10 +285,10 @@ public class Crc32Tests
     /// <summary>
     /// Ties the new API to the already-verified one: over a whole number of words, checksumming
     /// the big-endian serialisation byte by byte is by definition the same job as
-    /// <see cref="Crc32.Compute"/>.
+    /// <see cref="Crc32.ComputeBigEndian"/>.
     /// </summary>
     [TestCaseSource(nameof(Presets))]
-    public void Preset_ComputeBytes_OverBigEndianSerialisation_EqualsCompute(Preset preset)
+    public void Preset_ComputeBytes_OverBigEndianSerialisation_EqualsComputeBigEndian(Preset preset)
     {
         Random random = new(161803);
 
@@ -298,7 +298,7 @@ public class Crc32Tests
 
             Assert.That(
                 preset.Instance.ComputeBytes(ToBigEndianBytes(words)),
-                Is.EqualTo(preset.Instance.Compute(words)),
+                Is.EqualTo(preset.Instance.ComputeBigEndian(words)),
                 $"{preset.Name}, length {length}");
         }
     }
@@ -321,7 +321,7 @@ public class Crc32Tests
         using (Assert.EnterMultipleScope())
         {
             Assert.That(preset.Instance.ComputeBytes(data), Is.EqualTo(preset.Instance.ComputeLittleEndian(reinterpreted)));
-            Assert.That(preset.Instance.ComputeBytes(data), Is.Not.EqualTo(preset.Instance.Compute(reinterpreted)));
+            Assert.That(preset.Instance.ComputeBytes(data), Is.Not.EqualTo(preset.Instance.ComputeBigEndian(reinterpreted)));
         }
     }
 
@@ -389,7 +389,7 @@ public class Crc32Tests
             string context = $"{parameters} over [{string.Join(", ", data.Select(w => $"0x{w:X8}"))}]";
 
             Assert.That(
-                crc32.Compute(data),
+                crc32.ComputeBigEndian(data),
                 Is.EqualTo(ReferenceModel(parameters, ToBigEndianBytes(data))),
                 $"big-endian: {context}");
 
@@ -428,11 +428,11 @@ public class Crc32Tests
     // ------------------------------------------------------------ known values
 
     /// <summary>
-    /// The values this library produced before <see cref="Crc32Parameters"/> existed, when
-    /// MPEG-2 was hard-coded. They must not have moved.
+    /// Known MPEG-2 answers pinned as literals rather than derived from the reference model,
+    /// so a regression still surfaces if implementation and oracle ever drifted together.
     /// </summary>
     [TestCaseSource(nameof(KnownMpeg2BigEndianValues))]
-    public uint Mpeg2_Compute_KnownInput_ReturnsExpectedCrc(uint[] data) => Crc32.Mpeg2.Compute(data);
+    public uint Mpeg2_ComputeBigEndian_KnownInput_ReturnsExpectedCrc(uint[] data) => Crc32.Mpeg2.ComputeBigEndian(data);
 
     private static IEnumerable<TestCaseData> KnownMpeg2BigEndianValues()
     {
@@ -467,7 +467,7 @@ public class Crc32Tests
     public void Compute_ConsumesEachWordMostSignificantByteFirst()
     {
         Assert.That(
-            Crc32.Mpeg2.Compute([0x12345678]),
+            Crc32.Mpeg2.ComputeBigEndian([0x12345678]),
             Is.EqualTo(ReferenceModel(Crc32Parameters.Mpeg2, [0x12, 0x34, 0x56, 0x78])));
     }
 
@@ -486,7 +486,7 @@ public class Crc32Tests
         uint[] swapped = new uint[data.Length];
         BinaryPrimitives.ReverseEndianness(data, swapped);
 
-        Assert.That(preset.Instance.ComputeLittleEndian(data), Is.EqualTo(preset.Instance.Compute(swapped)));
+        Assert.That(preset.Instance.ComputeLittleEndian(data), Is.EqualTo(preset.Instance.ComputeBigEndian(swapped)));
     }
 
     [Test]
@@ -494,7 +494,7 @@ public class Crc32Tests
     {
         Assert.That(
             Crc32.Mpeg2.ComputeLittleEndian([0x12345678]),
-            Is.Not.EqualTo(Crc32.Mpeg2.Compute([0x12345678])));
+            Is.Not.EqualTo(Crc32.Mpeg2.ComputeBigEndian([0x12345678])));
     }
 
     // -------------------------------------------------------------- allocation
@@ -538,16 +538,16 @@ public class Crc32Tests
             uint seed = preset.Instance.InitialRegister;
 
             AssertAllocatesNothing(
-                $"{preset.Name}, Compute, {length} words",
-                () => preset.Instance.Compute(data));
+                $"{preset.Name}, ComputeBigEndian, {length} words",
+                () => preset.Instance.ComputeBigEndian(data));
 
             AssertAllocatesNothing(
                 $"{preset.Name}, ComputeLittleEndian, {length} words",
                 () => preset.Instance.ComputeLittleEndian(data));
 
             AssertAllocatesNothing(
-                $"{preset.Name}, Append, {length} words",
-                () => preset.Instance.Append(seed, data));
+                $"{preset.Name}, AppendBigEndian, {length} words",
+                () => preset.Instance.AppendBigEndian(seed, data));
 
             AssertAllocatesNothing(
                 $"{preset.Name}, AppendLittleEndian, {length} words",
@@ -622,7 +622,7 @@ public class Crc32Tests
     {
         uint[] data = RandomWords(new Random(8675309), 16);
 
-        uint[] results = Presets().Select(preset => preset.Instance.Compute(data)).ToArray();
+        uint[] results = Presets().Select(preset => preset.Instance.ComputeBigEndian(data)).ToArray();
 
         Assert.That(results, Is.Unique);
     }

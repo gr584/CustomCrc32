@@ -4,10 +4,10 @@ using BenchmarkDotNet.Attributes;
 namespace CustomCrc32.Benchmarks;
 
 /// <summary>
-/// Measures the shipping implementation against the two formulations it replaced: one bit at
-/// a time, and one table lookup per byte. The table baselines are reimplemented here rather
-/// than called through the library, because the library now folds automatically and there is
-/// no supported way to ask it not to.
+/// Measures the fold against two slower formulations: one bit at a time, and one table lookup
+/// per byte. The table baselines are reimplemented here rather than called through the
+/// library, because the library folds automatically and there is no supported way to ask it
+/// not to.
 /// </summary>
 public class Crc32Benchmarks
 {
@@ -36,7 +36,7 @@ public class Crc32Benchmarks
         }
 
         // The big-endian serialisation of the same words, so the byte path is checksumming
-        // exactly the message Compute is and the two must return the same value.
+        // exactly the message ComputeBigEndian is and the two must return the same value.
         _bytes = new byte[_data.Length * sizeof(uint)];
         for (int i = 0; i < _data.Length; i++)
         {
@@ -53,8 +53,8 @@ public class Crc32Benchmarks
 
         uint[] swapped = new uint[_data.Length];
         BinaryPrimitives.ReverseEndianness(_data, swapped);
-        Verify("forward byte-order identity", FoldedForwardLittleEndian(), Crc32.Mpeg2.Compute(swapped));
-        Verify("reflected byte-order identity", FoldedReflectedLittleEndian(), Crc32.IsoHdlc.Compute(swapped));
+        Verify("forward byte-order identity", FoldedForwardLittleEndian(), Crc32.Mpeg2.ComputeBigEndian(swapped));
+        Verify("reflected byte-order identity", FoldedReflectedLittleEndian(), Crc32.IsoHdlc.ComputeBigEndian(swapped));
 
         Verify("forward bytes vs words", FoldedForwardBytes(), FoldedForward());
         Verify("reflected bytes vs words", FoldedReflectedBytes(), FoldedReflected());
@@ -151,13 +151,13 @@ public class Crc32Benchmarks
     }
 
     [Benchmark(Description = "Folded forward BE")]
-    public uint FoldedForward() => Crc32.Mpeg2.Compute(_data);
+    public uint FoldedForward() => Crc32.Mpeg2.ComputeBigEndian(_data);
 
     [Benchmark(Description = "Folded forward LE")]
     public uint FoldedForwardLittleEndian() => Crc32.Mpeg2.ComputeLittleEndian(_data);
 
     [Benchmark(Description = "Folded reflected BE")]
-    public uint FoldedReflected() => Crc32.IsoHdlc.Compute(_data);
+    public uint FoldedReflected() => Crc32.IsoHdlc.ComputeBigEndian(_data);
 
     [Benchmark(Description = "Folded reflected LE")]
     public uint FoldedReflectedLittleEndian() => Crc32.IsoHdlc.ComputeLittleEndian(_data);

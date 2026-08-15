@@ -14,14 +14,15 @@ namespace CustomCrc32;
 /// <para>
 /// An instance owns the 256-entry lookup table derived from its parameters, so construct one
 /// per parameter set and reuse it. The named presets are shared instances and are the usual
-/// entry point: <c>Crc32.Mpeg2.Compute(words)</c>.
+/// entry point: <c>Crc32.Mpeg2.ComputeBigEndian(words)</c>.
 /// </para>
 /// <para>
 /// Instances are immutable and safe to use concurrently.
 /// </para>
 /// <para>
 /// Because the input is typed as <see cref="uint"/> rather than as raw bytes, the host
-/// machine's endianness never enters into it. <see cref="Compute(ReadOnlySpan{uint})"/> and
+/// machine's endianness never enters into it.
+/// <see cref="ComputeBigEndian(ReadOnlySpan{uint})"/> and
 /// <see cref="ComputeLittleEndian(ReadOnlySpan{uint})"/> select the byte order the words are
 /// treated as being <em>serialised</em> in, and return the same answer on every platform.
 /// </para>
@@ -100,7 +101,7 @@ public sealed class Crc32
 
     /// <summary>
     /// The register state a streaming computation starts from. Pass this as the first
-    /// <c>register</c> argument to <see cref="Append(uint, ReadOnlySpan{uint})"/>.
+    /// <c>register</c> argument to <see cref="AppendBigEndian(uint, ReadOnlySpan{uint})"/>.
     /// </summary>
     /// <remarks>
     /// This is the raw register, which for a reflected CRC is the bit-reverse of
@@ -150,7 +151,8 @@ public sealed class Crc32
     /// contributes its most significant byte first, so 0x12345678 is checksummed as the
     /// bytes 12 34 56 78.
     /// </summary>
-    public uint Compute(ReadOnlySpan<uint> data) => Finish(Append(InitialRegister, data));
+    public uint ComputeBigEndian(ReadOnlySpan<uint> data) =>
+        Finish(AppendBigEndian(InitialRegister, data));
 
     /// <summary>
     /// Computes the CRC of <paramref name="data"/> serialised little-endian &mdash; each word
@@ -168,7 +170,7 @@ public sealed class Crc32
     /// <param name="register">The running register state.</param>
     /// <param name="data">The words to fold in, each consumed most significant byte first.</param>
     /// <returns>The updated register state, which is not yet a CRC.</returns>
-    public uint Append(uint register, ReadOnlySpan<uint> data)
+    public uint AppendBigEndian(uint register, ReadOnlySpan<uint> data)
     {
         if (_canFold && data.Length >= FoldingThreshold * WordsPerBlock)
         {
@@ -200,7 +202,7 @@ public sealed class Crc32
 
     /// <summary>
     /// Folds a further run of little-endian words into a running register. The counterpart to
-    /// <see cref="Append(uint, ReadOnlySpan{uint})"/>.
+    /// <see cref="AppendBigEndian(uint, ReadOnlySpan{uint})"/>.
     /// </summary>
     /// <param name="register">The running register state.</param>
     /// <param name="data">The words to fold in, each consumed least significant byte first.</param>
@@ -245,15 +247,15 @@ public sealed class Crc32
     /// <para>
     /// In particular, prefer this over casting a byte buffer to <c>ReadOnlySpan&lt;uint&gt;</c>
     /// with <see cref="MemoryMarshal.Cast{TFrom,TTo}(ReadOnlySpan{TFrom})"/> and calling
-    /// <see cref="Compute(ReadOnlySpan{uint})"/>. That cast reads each group of four bytes in
-    /// the host's byte order, so it silently produces a different answer on a big-endian
-    /// machine than on a little-endian one, and it cannot represent a trailing partial word
-    /// at all.
+    /// <see cref="ComputeBigEndian(ReadOnlySpan{uint})"/>. That cast reads each group of four
+    /// bytes in the host's byte order, so it silently produces a different answer on a
+    /// big-endian machine than on a little-endian one, and it cannot represent a trailing
+    /// partial word at all.
     /// </para>
     /// <para>
-    /// This is deliberately not an overload of <see cref="Compute(ReadOnlySpan{uint})"/>:
+    /// This is deliberately not an overload of <see cref="ComputeBigEndian(ReadOnlySpan{uint})"/>:
     /// overloading on both span element types would make collection-expression calls such as
-    /// <c>Compute([])</c> ambiguous.
+    /// <c>ComputeBigEndian([])</c> ambiguous.
     /// </para>
     /// </remarks>
     public uint ComputeBytes(ReadOnlySpan<byte> data) => Finish(AppendBytes(InitialRegister, data));

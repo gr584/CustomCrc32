@@ -22,8 +22,8 @@ using CustomCrc32;
 
 uint[] words = [0x12345678, 0x9ABCDEF0];
 
-uint crc = Crc32.Mpeg2.Compute(words);      // 0x7D24A31B
-uint zlib = Crc32.IsoHdlc.Compute(words);   // the usual "CRC-32"
+uint crc = Crc32.Mpeg2.ComputeBigEndian(words);      // 0x7D24A31B
+uint zlib = Crc32.IsoHdlc.ComputeBigEndian(words);   // the usual "CRC-32"
 
 // Data that is really bytes rather than words has its own entry point, taking any length.
 uint ofFile = Crc32.IsoHdlc.ComputeBytes(File.ReadAllBytes("payload.bin"));
@@ -66,8 +66,8 @@ CRC-32C, used by iSCSI, ext4, Btrfs and SCTP.
 
 Two notes on the more surprising entries. `Cksum` is the polynomial POSIX `cksum` uses, but
 that utility also appends the message length to the input before checksumming; this library
-does not do that for you. And `Mpeg2` is the parameter set this project was originally
-written around, kept as a preset.
+does not do that for you. And `Mpeg2` shares `IsoHdlc`'s polynomial but runs unreflected with
+no final XOR, which is why the two give completely different answers over the same input.
 
 Each name exists in two places: `Crc32Parameters.Mpeg2` is the parameter *values*, and
 `Crc32.Mpeg2` is a ready-to-use shared instance.
@@ -95,14 +95,14 @@ public sealed class Crc32
     // …and ten more
 
     // One-shot over words. The suffix selects the byte order the words are serialised in.
-    public uint Compute(ReadOnlySpan<uint> data);
+    public uint ComputeBigEndian(ReadOnlySpan<uint> data);
     public uint ComputeLittleEndian(ReadOnlySpan<uint> data);
 
     // One-shot over bytes. Any length; no byte order to choose.
     public uint ComputeBytes(ReadOnlySpan<byte> data);
 
     // Streaming.
-    public uint Append(uint register, ReadOnlySpan<uint> data);
+    public uint AppendBigEndian(uint register, ReadOnlySpan<uint> data);
     public uint AppendLittleEndian(uint register, ReadOnlySpan<uint> data);
     public uint AppendBytes(uint register, ReadOnlySpan<byte> data);
     public uint Finish(uint register);
@@ -111,7 +111,7 @@ public sealed class Crc32
 
 An instance owns the 256-entry table derived from its parameters, so **construct one per
 parameter set and reuse it**. Instances are immutable and safe to use concurrently. The
-presets are shared instances, so `Crc32.Mpeg2.Compute(…)` allocates nothing — see
+presets are shared instances, so `Crc32.Mpeg2.ComputeBigEndian(…)` allocates nothing — see
 [allocation and copying](#allocation-and-copying).
 
 Inputs are `ReadOnlySpan<uint>` or `ReadOnlySpan<byte>`, so a `Span<T>`, an array, a
@@ -119,9 +119,9 @@ stack-allocated buffer, a UTF-8 literal (`"…"u8`) or a collection expression a
 a cast.
 
 **Which entry point:** if your data is genuinely *words* — values you hold as `uint` and are
-choosing a serialisation for — use `Compute` or `ComputeLittleEndian`. If it is genuinely
-*bytes* — a file, a packet, a wire message — use `ComputeBytes`. The distinction is not
-cosmetic; see [endianness](#a-note-on-endianness) below.
+choosing a serialisation for — use `ComputeBigEndian` or `ComputeLittleEndian`. If it is
+genuinely *bytes* — a file, a packet, a wire message — use `ComputeBytes`. The distinction is
+not cosmetic; see [endianness](#a-note-on-endianness) below.
 
 ### Allocation and copying
 
@@ -136,9 +136,9 @@ asserts this for all twelve presets and all six entry points; see
 
 **No heap allocation**, because nothing on the path constructs a reference type:
 
-- The register is a `uint` threaded through by value — `Compute` is
-  `Finish(Append(InitialRegister, data))`, with no wrapper object, builder or state bag. This
-  is the payoff of the functional streaming API over a mutable accumulator type.
+- The register is a `uint` threaded through by value — `ComputeBigEndian` is
+  `Finish(AppendBigEndian(InitialRegister, data))`, with no wrapper object, builder or state
+  bag. This is the payoff of the functional streaming API over a mutable accumulator type.
 - `ReadOnlySpan<T>` is a ref struct, so slicing it and reinterpreting it with
   `MemoryMarshal.AsBytes` yields another struct on the stack, never a new buffer.
 - `foreach` over a span uses that span's struct enumerator, so there is no `IEnumerator` to
@@ -148,7 +148,7 @@ asserts this for all twelve presets and all six entry points; see
 
 The only allocation in the type is **per instance, in the constructor**: the 256-entry lookup
 table (1 KiB) and the object holding it. With a preset that has already happened in a static
-initializer, so `Crc32.Mpeg2.Compute(…)` allocates nothing whatsoever.
+initializer, so `Crc32.Mpeg2.ComputeBigEndian(…)` allocates nothing whatsoever.
 
 **Zero-copy**, because blocks are consumed where they lie:
 
@@ -182,7 +182,7 @@ var crc32 = new Crc32(new Crc32Parameters(
     ReflectOutput: false,
     XorOut:        0x00000000));
 
-uint crc = crc32.Compute(words);
+uint crc = crc32.ComputeBigEndian(words);
 ```
 
 Give the polynomial in **normal form** even for a reflected variant — pass `0x04C11DB7`, not
@@ -190,21 +190,22 @@ Give the polynomial in **normal form** even for a reflected variant — pass `0x
 
 ### Streaming
 
-`Compute` is `Finish(Append(InitialRegister, data))`. Splitting those apart lets you
-checksum a stream in pieces:
+`ComputeBigEndian` is `Finish(AppendBigEndian(InitialRegister, data))`. Splitting those apart
+lets you checksum a stream in pieces:
 
 ```csharp
 uint register = crc32.InitialRegister;
 while (TryReadChunk(out ReadOnlySpan<uint> chunk))
 {
-    register = crc32.Append(register, chunk);
+    register = crc32.AppendBigEndian(register, chunk);
 }
 uint crc = crc32.Finish(register);
 ```
 
-`Append` returns the **raw register**, not a CRC — output reflection and the final XOR are
-applied by `Finish`. Keep them apart: feeding a finished value back into `Append` gives a
-wrong answer for any parameter set with a non-zero `XorOut` or mismatched reflection.
+`AppendBigEndian` returns the **raw register**, not a CRC — output reflection and the final
+XOR are applied by `Finish`. Keep them apart: feeding a finished value back into
+`AppendBigEndian` gives a wrong answer for any parameter set with a non-zero `XorOut` or
+mismatched reflection.
 
 ## A note on endianness
 
@@ -214,11 +215,11 @@ all — a byte buffer already carries its own order — so if that is what you a
 
 Where the input is typed as `uint` rather than as raw bytes, **the host machine's endianness
 never enters into it**. The algorithm consumes each word bit by bit regardless of how that
-word is laid out in memory. The choice between `Compute` and `ComputeLittleEndian` is about
-the byte order your words will be *serialised* in, and the same call returns the same answer
-on x64, ARM, or anything else.
+word is laid out in memory. The choice between `ComputeBigEndian` and `ComputeLittleEndian`
+is about the byte order your words will be *serialised* in, and the same call returns the
+same answer on x64, ARM, or anything else.
 
-- `Compute` — each word contributes its most significant byte first: `0x12345678` is
+- `ComputeBigEndian` — each word contributes its most significant byte first: `0x12345678` is
   checksummed as the bytes `12 34 56 78`.
 - `ComputeLittleEndian` — least significant byte first: `78 56 34 12`.
 
@@ -263,13 +264,13 @@ each group of four bytes in the *host's* order, so the buffer `12 34 56 78` beco
 `0x78563412` on a little-endian machine and `0x12345678` on a big-endian one — silently a
 different answer per platform, no error, and a trailing partial word cannot be represented at
 all. Concretely, on a little-endian host the cast happens to line up with
-`ComputeLittleEndian` and *not* with `Compute`, which is exactly the kind of accident that
-survives testing on one architecture and fails on another. There is a test pinning that
+`ComputeLittleEndian` and *not* with `ComputeBigEndian`, which is exactly the kind of accident
+that survives testing on one architecture and fails on another. There is a test pinning that
 relationship so the trap stays documented rather than rediscovered.
 
-`ComputeBytes` is deliberately **not** an overload of `Compute`: overloading on
+`ComputeBytes` is deliberately **not** an overload of `ComputeBigEndian`: overloading on
 `ReadOnlySpan<byte>` alongside `ReadOnlySpan<uint>` would make collection-expression calls
-like `Compute([])` ambiguous.
+like `ComputeBigEndian([])` ambiguous.
 
 Performance is unaffected by the choice — the byte path folds through the same accelerated
 kernel and runs at the same throughput, with 0–15 trailing bytes finished by the table.
@@ -282,9 +283,9 @@ instructions. Both are driven by the same parameter set and produce identical an
 test appends a single word per call and another a single byte per call, keeping every call
 under the folding threshold, and both require the result to match the single-shot folded call.
 
-All three entry points share one fold kernel. `Append`, `AppendLittleEndian` and `AppendBytes`
-differ only in the byte permutation they hand it and in how they finish the tail, so the
-byte API is not a second implementation to keep in step.
+All three entry points share one fold kernel. `AppendBigEndian`, `AppendLittleEndian` and
+`AppendBytes` differ only in the byte permutation they hand it and in how they finish the
+tail, so the byte API is not a second implementation to keep in step.
 
 ### Carry-less multiply folding
 
@@ -477,24 +478,25 @@ Everything else is then checked against the oracle:
   unrolled loop, its remainder, and the sub-block tail.
 - **Split invariance** — the same input broken at every seventh word must give the same answer
   as one pass, which it would not if the accumulator carried state the register cannot express.
-- Streaming: chunked `Append`/`AppendLittleEndian` then `Finish` must equal the one-shot
-  result, for every preset, including a zero-length chunk.
+- Streaming: chunked `AppendBigEndian`/`AppendLittleEndian` then `Finish` must equal the
+  one-shot result, for every preset, including a zero-length chunk.
 - `InitialRegister` is the reversed initial value when reflected and unchanged when not,
   pinned with `0x0000FFFF` — a value that would survive a no-op "reversal".
-- Byte order: `ComputeLittleEndian(data)` equals `Compute(swapped)` for every preset, and
-  differs from `Compute(data)` on an asymmetric word.
+- Byte order: `ComputeLittleEndian(data)` equals `ComputeBigEndian(swapped)` for every preset,
+  and differs from `ComputeBigEndian(data)` on an asymmetric word.
 - All twelve presets produce distinct results for the same input.
-- The fifteen MPEG-2 values this library produced before `Crc32Parameters` existed still
-  hold, so the migration is known not to have moved any answers.
+- Fifteen MPEG-2 answers pinned as literals rather than derived from the oracle, so a
+  regression still surfaces if implementation and oracle ever drifted together.
 
 The byte path adds a stronger anchor than any of these, because it needs no oracle at all:
 `ComputeBytes("123456789"u8)` is held directly against the twelve published check values,
 which are *defined* over bytes. Beyond that it is checked at every length from 0 to 80 bytes
 and around the larger fold boundaries, split at **every** offset in a 300-byte buffer rather
-than on word boundaries, against byte-at-a-time appending, against `Compute` over the same
-big-endian serialisation, on empty input, and over 400 random parameter sets. One further test pins the
-`MemoryMarshal.Cast` relationship described above — on a little-endian host the cast agrees
-with `ComputeLittleEndian` and disagrees with `Compute` — so the trap stays documented.
+than on word boundaries, against byte-at-a-time appending, against `ComputeBigEndian` over
+the same big-endian serialisation, on empty input, and over 400 random parameter sets. One
+further test pins the `MemoryMarshal.Cast` relationship described above — on a little-endian
+host the cast agrees with `ComputeLittleEndian` and disagrees with `ComputeBigEndian` — so the
+trap stays documented.
 
 Twenty-four further tests check something no oracle can express: that the entry points
 **allocate nothing**. Each warms the JIT and the presets' static initialiser, then requires a
@@ -519,9 +521,8 @@ else**, which is exactly the gap those tests exist to close.
 [`CustomCrc32.Benchmarks`](CustomCrc32.Benchmarks/) holds three sets, each answering a
 different question:
 
-- **`Crc32Benchmarks`** — the shipping implementation against the two formulations it
-  replaced, one bit at a time and one table lookup per byte, across input sizes at different
-  levels of the memory hierarchy.
+- **`Crc32Benchmarks`** — the fold against two slower formulations, one bit at a time and one
+  table lookup per byte, across input sizes at different levels of the memory hierarchy.
 - **`FoldLaneBenchmarks`** — the fold kernel at one, two, four and eight accumulator lanes
   over a cache-resident buffer, which is what pins down [why four](#four-accumulator-lanes).
 - **`StreamingBenchmarks`** — 1 GiB in 1 MiB calls, each megabyte met for the first time,
@@ -535,7 +536,7 @@ is checked before it is timed: `GlobalSetup` throws if any two paths that should
 diverged, because a speed comparison stops meaning anything once a baseline is wrong. The lane
 variants are held against `Crc32.IsoHdlc.ComputeBytes`, the answer the test suite pins; the
 byte buffer in the first set holds the big-endian serialisation of the same words, so it must
-return what `Compute` does.
+return what `ComputeBigEndian` does.
 
 `ThroughputColumn` is a custom `IColumn` adding a GB/s column derived from the mean and
 whichever length parameter the case declares — `WordCount` or `ByteCount`. BenchmarkDotNet has
@@ -561,8 +562,8 @@ X64 RyuJIT x86-64-v3, BenchmarkDotNet 0.15.8. **Taken with `--job short`** (3 wa
 iterations) — good enough for the headline ratios, but re-run with the default job before
 quoting these anywhere.
 
-Throughput, higher is better. *Table* is the previous implementation, kept here as the
-baseline the fold replaced:
+Throughput, higher is better. *Table* is one lookup per byte — the same formulation the
+library still runs for short inputs, for the tail, and on machines without the instructions:
 
 | WordCount        | Bitwise  | Table fwd | Table refl | Fold fwd BE | Fold fwd LE | Fold refl BE | Fold refl LE |
 | ---------------- | -------- | --------- | ---------- | ----------- | ----------- | ------------ | ------------ |
@@ -753,32 +754,3 @@ The two solution-level commands need an SDK that understands `.slnx` — see
 [Requirements](#requirements). Point them at the individual `.csproj` files on an older one.
 
 Benchmarks must be run against a Release build; BenchmarkDotNet will refuse otherwise.
-
-## Migrating from the hard-coded version
-
-Before `Crc32Parameters`, `Crc32` was a static class fixed to CRC-32/MPEG-2.
-
-| Before                            | After                              |
-| --------------------------------- | ---------------------------------- |
-| `Crc32.Compute(data)`             | `Crc32.Mpeg2.Compute(data)`        |
-| `Crc32.ComputeLittleEndian(data)` | `Crc32.Mpeg2.ComputeLittleEndian(data)` |
-| `Crc32.Polynomial`                | `Crc32Parameters.Mpeg2.Polynomial` |
-| `Crc32.InitialValue`              | `Crc32Parameters.Mpeg2.InitialValue` |
-| `Crc32.XorOut`                    | `Crc32Parameters.Mpeg2.XorOut`     |
-| `Crc32.Compute(data, seed)`       | `Append` / `Finish` — see below    |
-
-Results are unchanged; the old MPEG-2 values are still asserted by the test suite.
-
-The seeded overload is the one real break. It used to double as both "resume from here" and
-"here is your answer", which worked only because MPEG-2 has a zero `XorOut` and symmetric
-reflection. That no longer holds in general, so resuming and finishing are now separate
-operations:
-
-```csharp
-// before
-uint crc = Crc32.Compute(tail, Crc32.Compute(head));
-
-// after
-uint register = Crc32.Mpeg2.Append(Crc32.Mpeg2.Append(Crc32.Mpeg2.InitialRegister, head), tail);
-uint crc = Crc32.Mpeg2.Finish(register);
-```
