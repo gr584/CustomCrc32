@@ -39,7 +39,8 @@ uint ofFile = Crc32.IsoHdlc.ComputeBytes(File.ReadAllBytes("payload.bin"));
 - No runtime package dependencies — the library is plain BCL code.
 - Hardware acceleration engages automatically where `PCLMULQDQ` and `SSSE3` are available,
   which on x86-64 means anything from Westmere (2010) onwards. Elsewhere — including ARM —
-  the table path runs instead and returns identical answers.
+  the table path runs instead and returns identical answers. `Crc32.IsHardwareAccelerated`
+  reports which of the two you are getting, for logging rather than for branching.
 
 ## Presets
 
@@ -88,6 +89,10 @@ public sealed class Crc32
 
     public Crc32Parameters Parameters { get; }
     public uint InitialRegister { get; }
+
+    // True where the carry-less multiply fold is available. Reports speed, not behaviour —
+    // the answer is identical either way.
+    public static bool IsHardwareAccelerated { get; }
 
     // Shared preset instances — one per row of the table above.
     public static Crc32 IsoHdlc { get; }
@@ -452,7 +457,7 @@ polynomials, initial values and final XORs before the implementation was written
 
 ## Correctness
 
-The test suite ([`CustomCrc32.Test`](CustomCrc32.Test/Crc32Tests.cs), NUnit, 276 tests) is
+The test suite ([`CustomCrc32.Test`](CustomCrc32.Test/Crc32Tests.cs), NUnit, 277 tests) is
 built on a single oracle: **Williams' model spelled out literally** — feed each byte in at
 the top of the register, clock it one bit at a time, reflect on the way in and out where
 asked. It is deliberately naive and structurally unlike the table-driven implementation, and

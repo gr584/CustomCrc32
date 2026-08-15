@@ -1,4 +1,5 @@
 using System.Buffers.Binary;
+using System.Runtime.Intrinsics.X86;
 
 namespace CustomCrc32.Test;
 
@@ -120,6 +121,20 @@ public class Crc32Tests
     }
 
     // --------------------------------------------------------- accelerated path
+
+    /// <summary>
+    /// Pins the definition rather than the value, which is whatever this machine happens to
+    /// offer. The fold needs both instruction sets, so reporting support on the strength of
+    /// only one would promise acceleration on a machine that cannot shuffle a block into the
+    /// engine's working order.
+    /// </summary>
+    [Test]
+    public void IsHardwareAccelerated_RequiresBothInstructionSets()
+    {
+        Assert.That(
+            Crc32.IsHardwareAccelerated,
+            Is.EqualTo(Pclmulqdq.IsSupported && Ssse3.IsSupported));
+    }
 
     /// <summary>
     /// Lengths straddling every boundary the folding path has: the threshold below which it

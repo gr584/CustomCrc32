@@ -62,9 +62,6 @@ public sealed class Crc32
     /// </summary>
     private const int FoldingThreshold = 2;
 
-    /// <summary>True when this machine has the carry-less multiply and shuffle instructions.</summary>
-    private readonly bool _canFold;
-
     /// <summary>Constants for folding one block, and four blocks, ahead.</summary>
     private readonly Vector128<ulong> _foldByOneBlock;
     private readonly Vector128<ulong> _foldByFourBlocks;
@@ -86,8 +83,7 @@ public sealed class Crc32
         // has to be carried into that domain too.
         InitialRegister = parameters.ReflectInput ? Reverse(parameters.InitialValue) : parameters.InitialValue;
 
-        _canFold = Pclmulqdq.IsSupported && Ssse3.IsSupported;
-        if (_canFold)
+        if (IsHardwareAccelerated)
         {
             _foldByOneBlock = FoldConstants(128, parameters.Polynomial, parameters.ReflectInput);
             _foldByFourBlocks = FoldConstants(512, parameters.Polynomial, parameters.ReflectInput);
@@ -109,6 +105,26 @@ public sealed class Crc32
     /// input &mdash; that is <c>Finish(InitialRegister)</c>.
     /// </remarks>
     public uint InitialRegister { get; }
+
+    /// <summary>
+    /// True where the carry-less multiply fold is available, which needs both
+    /// <c>PCLMULQDQ</c> and <c>SSSE3</c> &mdash; on x86-64, anything from Westmere (2010)
+    /// onwards. False elsewhere, including on ARM.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// This is a property of the machine rather than of any parameter set, so it is the same
+    /// for every instance and every preset.
+    /// </para>
+    /// <para>
+    /// It reports speed, not behaviour. Every entry point returns the same answer either way;
+    /// where this is <see langword="false"/> the table path runs instead, which the
+    /// benchmarks put at roughly a thirty-eighth of the folded throughput at steady state.
+    /// Nothing needs configuring on the strength of it, so it is here for diagnostics and
+    /// logging rather than as something to branch on.
+    /// </para>
+    /// </remarks>
+    public static bool IsHardwareAccelerated => Pclmulqdq.IsSupported && Ssse3.IsSupported;
 
     /// <summary>CRC-32/ISO-HDLC: zlib, PNG, gzip, Ethernet, ZIP.</summary>
     public static Crc32 IsoHdlc { get; } = new(Crc32Parameters.IsoHdlc);
@@ -172,7 +188,7 @@ public sealed class Crc32
     /// <returns>The updated register state, which is not yet a CRC.</returns>
     public uint AppendBigEndian(uint register, ReadOnlySpan<uint> data)
     {
-        if (_canFold && data.Length >= FoldingThreshold * WordsPerBlock)
+        if (IsHardwareAccelerated && data.Length >= FoldingThreshold * WordsPerBlock)
         {
             int folded = data.Length / WordsPerBlock * WordsPerBlock;
             register = FoldBlocks(register, MemoryMarshal.AsBytes(data[..folded]), _bigEndianShuffle);
@@ -209,7 +225,7 @@ public sealed class Crc32
     /// <returns>The updated register state, which is not yet a CRC.</returns>
     public uint AppendLittleEndian(uint register, ReadOnlySpan<uint> data)
     {
-        if (_canFold && data.Length >= FoldingThreshold * WordsPerBlock)
+        if (IsHardwareAccelerated && data.Length >= FoldingThreshold * WordsPerBlock)
         {
             int folded = data.Length / WordsPerBlock * WordsPerBlock;
             register = FoldBlocks(register, MemoryMarshal.AsBytes(data[..folded]), _littleEndianShuffle);
@@ -278,7 +294,7 @@ public sealed class Crc32
         // little-endian shuffle produces: serialising little-endian words that were themselves
         // read little-endian from memory reproduces the underlying byte order. So this is the
         // right permutation here for both engines, despite the name.
-        if (_canFold && data.Length >= FoldingThreshold * BytesPerBlock)
+        if (IsHardwareAccelerated && data.Length >= FoldingThreshold * BytesPerBlock)
         {
             int folded = data.Length / BytesPerBlock * BytesPerBlock;
             register = FoldBlocks(register, data[..folded], _littleEndianShuffle);
