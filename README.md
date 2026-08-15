@@ -533,6 +533,9 @@ different question:
 - **`StreamingBenchmarks`** — 1 GiB in 1 MiB calls, each megabyte met for the first time,
   against a pure-read roofline and a resident-buffer control. This is the streaming rate, and
   it is not the same number as the one above.
+- **`Crc32cHardwareBenchmarks`** — the fold against SSE4.2's dedicated `CRC32` instruction,
+  both producing CRC-32C, which is [the one comparison](#against-the-dedicated-crc-instruction)
+  where the library is at a structural disadvantage.
 
 Baselines that the library does not expose are reimplemented inside the benchmark — the table
 formulations in the first set, the other lane counts in `FoldLanes` — since the library folds
@@ -699,6 +702,59 @@ table. It is a memory effect, not a pipeline one, and worth about 5%.
 For most callers none of this is the bottleneck: at ~15 GB/s the fold already outruns any
 single NVMe drive, so a CRC over a file read from disk is not what the program is waiting for.
 
+### Against the dedicated CRC instruction
+
+SSE4.2 has a `CRC32` instruction that does in one step what the fold does in two carry-less
+multiplies and a shuffle — but only for the Castagnoli polynomial. `Crc32cHardwareBenchmarks`
+puts it against the fold over the same bytes, both returning the same CRC-32C. This is the
+one comparison where the library is at a structural disadvantage, which is what makes it
+worth running.
+
+| Input             | Fold (any polynomial) | SSE4.2, one chain | SSE4.2, three chains |
+| ----------------- | --------------------- | ----------------- | -------------------- |
+| 4 KiB (L1)        | **21.38 GB/s**        | 12.43 GB/s        | 19.43 GB/s           |
+| 64 KiB (L2)       | **23.93 GB/s**        | 12.17 GB/s        | 23.20 GB/s           |
+| 1 MiB (L3)        | **22.80 GB/s**        | 12.17 GB/s        | 22.06 GB/s           |
+| 16 MiB (past L3)  | **15.10 GB/s**        | 10.05 GB/s        | 10.23 GB/s           |
+
+**The dedicated instruction does not beat the fold.** Interleaved three ways it reaches
+parity — 3% behind at 64 KiB and at 1 MiB, close enough to call level — and past L3 the fold
+is clearly ahead.
+
+**Used the obvious way it loses by half.** A single chain sits at 12.2 GB/s at every
+cache-resident size, which is precisely the latency bound: eight bytes per `CRC32`, three
+cycles of latency, 2.67 bytes per cycle. That is the same lesson as
+[four accumulator lanes](#four-accumulator-lanes), arrived at from the other direction. The
+instruction is pipelined, and one dependency chain wastes most of it — being a single-purpose
+unit does not exempt it.
+
+Two caveats on reading the table. The three-chain figure is a **floor rather than a ceiling**:
+it reaches about 5.1 bytes per cycle against a theoretical 8, because recombining the chains
+costs real time. Recombining with `PCLMULQDQ` instead of a GF(2) matrix, or using larger
+chunks, would close some of that, and a maximally tuned CRC-32C could plausibly edge past the
+fold in cache. It would not change the cold-data column, where memory binds. And the 16 MiB
+three-chain measurement is noisy — σ of 152 µs against a 1,640 µs mean — so treat it as
+approximate.
+
+<details>
+<summary>A trap this benchmark walked into first</summary>
+
+The three-chain figures were initially *worse* as the input grew: 14.09 GB/s at 4 KiB falling
+to 3.55 GB/s at 16 MiB. No instruction behaves that way, so the fault was in the measurement.
+
+Recombining the chains selects columns of a GF(2) matrix by the bits of a CRC value. Written
+as `if ((vector & 1) != 0)` that is thirty-two unpredictable branches per call, twice per
+block, mispredicting about half the time — costing more than the CRC instructions being
+recombined. The size dependence is the tell: over a small buffer the predictor memorises the
+handful of values that recur every invocation, so the cost only appears once the input
+outgrows what it can hold, and the result then describes the branch predictor rather than the
+instruction under test.
+
+Making the selection branchless removed the size dependence entirely, which is what confirmed
+the diagnosis. Both the fix and the reason are commented in `Crc32cHardware.cs` so it does not
+come back.
+</details>
+
 ### Going further
 
 Nothing here is the ceiling.
@@ -707,10 +763,13 @@ Nothing here is the ceiling.
 again, but it needs Ice Lake or newer, and .NET 8 does not expose `Pclmulqdq.V256` at all —
 that arrived later. This machine is Coffee Lake, so it was not an option to measure.
 
-**`Sse42.Crc32`** is worth a mention and a warning. It is a single instruction computing a
-CRC directly, but it is hardwired to the Castagnoli polynomial, so it could accelerate
-`Crc32.Castagnoli` and nothing else. Given folding already reaches ~21 GB/s for *every*
-parameter set, a special case for one preset did not seem worth the branch.
+**`Sse42.Crc32`** is measured rather than assumed, and it is the one door that turns out to be
+closed. It computes a CRC in a single instruction, but is hardwired to the Castagnoli
+polynomial, so it could accelerate `Crc32.Castagnoli` and none of the other eleven presets —
+let alone an arbitrary parameter set. What it buys for that narrowing is nothing: properly
+interleaved it draws level with the fold and no better, and past L3 it loses. A second kernel
+and a recombination step, for one preset, to stand still. See
+[against the dedicated CRC instruction](#against-the-dedicated-crc-instruction).
 
 **Skipping the identity `pshufb`** is the one clearly unclaimed win left, and it is no longer
 a guess. Where the permutation is the identity — the reflected engine reading bytes or
@@ -736,10 +795,12 @@ CustomCrc32.slnx                  Solution (new-style XML format)
 ├── CustomCrc32.Test/             NUnit test suite
 │   └── Crc32Tests.cs
 └── CustomCrc32.Benchmarks/       BenchmarkDotNet console app
-    ├── Crc32Benchmarks.cs        Fold against the bitwise and table formulations
-    ├── FoldLanes.cs              The fold kernel with the lane count made configurable
-    ├── FoldLaneBenchmarks.cs     One, two, four and eight lanes, cache-resident
-    ├── StreamingBenchmarks.cs    1 GiB cold, against a pure-read roofline
+    ├── Crc32Benchmarks.cs           Fold against the bitwise and table formulations
+    ├── FoldLanes.cs                 The fold kernel with the lane count made configurable
+    ├── FoldLaneBenchmarks.cs        One, two, four and eight lanes, cache-resident
+    ├── StreamingBenchmarks.cs       1 GiB cold, against a pure-read roofline
+    ├── Crc32cHardware.cs            CRC-32C via SSE4.2, one chain and three
+    ├── Crc32cHardwareBenchmarks.cs  The fold against the dedicated CRC instruction
     ├── ThroughputColumn.cs
     └── Program.cs
 ```
