@@ -16,9 +16,11 @@ namespace CustomCrc32.Benchmarks;
 /// Until 11.0 the comparison was not worth drawing: <c>System.IO.Hashing.Crc32</c> computed
 /// ISO-HDLC and nothing else, so there was no overlap to measure outside a single preset.
 /// <c>Crc32ParameterSet.Create</c> now takes a polynomial, an initial value, a final XOR and a
-/// reflection flag &mdash; the same Rocksoft model <see cref="Crc32Parameters"/> uses, with
-/// input and output reflection collapsed into one flag. Every one of this library's twelve
-/// presets maps onto it unchanged, so the two really are answering the same question.
+/// reflection flag &mdash; near enough the Rocksoft model <see cref="Crc32Parameters"/> uses,
+/// differing in that input and output reflection collapse into one flag and that the initial
+/// value is the register to start from rather than the catalogue's unreflected <c>Init</c>.
+/// Every one of this library's twelve presets maps onto it, so the two really are answering
+/// the same question; <see cref="Create"/> handles the two differences.
 /// </para>
 /// <para>
 /// Three parameter sets are measured, chosen to separate things that would otherwise be
@@ -86,11 +88,20 @@ public class SystemIoHashingBenchmarks
     }
 
     /// <summary>
-    /// The package's parameter set for one of this library's. The two models agree on the
-    /// polynomial's normal form, the initial value and the final XOR; the package carries a
-    /// single reflection flag where this library carries two, which every catalogued CRC-32
-    /// sets identically anyway.
+    /// The package's parameter set for one of this library's. The polynomial's normal form and
+    /// the final XOR mean the same thing to both; the reflection flag and the initial value
+    /// need handling.
     /// </summary>
+    /// <remarks>
+    /// The package carries one reflection flag where this library carries two, which no
+    /// catalogued CRC-32 sets differently. Its initial value is the register to start from,
+    /// where this library follows the catalogue and states <c>Init</c> in the unreflected
+    /// domain, so a reflected set needs the bit reversal applying first. Every preset used
+    /// here initialises to <c>0xFFFFFFFF</c>, a bit-reversal palindrome, so the reversal is a
+    /// no-op for these three cases &mdash; it is here because a helper that takes arbitrary
+    /// parameters should not be silently wrong for the ones nobody passed it yet. The test
+    /// suite covers the distinction properly.
+    /// </remarks>
     private static Crc32ParameterSet Create(Crc32Parameters parameters)
     {
         if (parameters.ReflectInput != parameters.ReflectOutput)
@@ -102,9 +113,21 @@ public class SystemIoHashingBenchmarks
 
         return Crc32ParameterSet.Create(
             parameters.Polynomial,
-            parameters.InitialValue,
+            parameters.ReflectInput ? Reverse(parameters.InitialValue) : parameters.InitialValue,
             parameters.XorOut,
             parameters.ReflectInput);
+    }
+
+    private static uint Reverse(uint value)
+    {
+        uint reversed = 0;
+
+        for (int bit = 0; bit < 32; bit++)
+        {
+            reversed = (reversed << 1) | ((value >> bit) & 1);
+        }
+
+        return reversed;
     }
 
     private void Verify(string what, uint actual, uint expected)

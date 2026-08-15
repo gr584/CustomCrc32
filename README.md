@@ -459,12 +459,13 @@ polynomials, initial values and final XORs before the implementation was written
 
 ## Correctness
 
-The test suite ([`CustomCrc32.Test`](CustomCrc32.Test/Crc32Tests.cs), NUnit, 277 tests) is
-built on a single oracle: **Williams' model spelled out literally** — feed each byte in at
-the top of the register, clock it one bit at a time, reflect on the way in and out where
-asked. It is deliberately naive and structurally unlike the table-driven implementation, and
-its own bit reversals are loop-based rather than the library's bit-twiddling version, so the
-two are unlikely to share a mistake.
+The test suite ([`CustomCrc32.Test`](CustomCrc32.Test/Crc32Tests.cs), NUnit, 375 tests) is
+built on two independent oracles. The first is **Williams' model spelled out literally** — feed
+each byte in at the top of the register, clock it one bit at a time, reflect on the way in and
+out where asked. It is deliberately naive and structurally unlike the table-driven
+implementation, and its own bit reversals are loop-based rather than the library's
+bit-twiddling version, so the two are unlikely to share a mistake. The second is
+[`System.IO.Hashing`](#a-second-oracle), described below.
 
 That oracle is anchored by the twelve published check values: running each preset's
 parameters over `123456789` must reproduce the catalogued constant. Passing means the preset
@@ -522,6 +523,74 @@ words in the wrong byte order fails 31, and dropping the input byte from either 
 single-byte step fails 36 and 26. And a `data.ToArray()` slipped into `AppendLittleEndian` —
 a copy that moves no answer at all — fails the twelve word-allocation tests and **nothing
 else**, which is exactly the gap those tests exist to close.
+
+### A second oracle
+
+Ninety-eight of those tests check this library against `System.IO.Hashing` rather than against
+the reference model. Its 11.0 pre-release takes a configurable parameter set, so for the first
+time there is a second implementation covering the same ground rather than one preset of it.
+
+It makes an unusually good oracle. It was written by other people, from the catalogue rather
+than from this code — and on this `net8.0` target it resolves the package's `netstandard2.0`
+asset, which carries no hardware intrinsics at all. So these tests hold a carry-less multiply
+fold against an implementation that does not fold. Where the machine lacks `PCLMULQDQ` or
+`SSSE3` they still pass, having compared two non-folding implementations instead, so every
+assertion message carries `Crc32.IsHardwareAccelerated` and a failure says which path was
+actually running.
+
+The second oracle is anchored exactly as the first is: the package, driven through a parameter
+set built from this library's, must reproduce all twelve published check values. Passing means
+the parameter models really do line up, which everything else here depends on. Then, for every
+preset:
+
+- `ComputeBytes` at every length from 0 to 80 bytes, and at eighteen lengths around the larger
+  fold boundaries.
+- **Large buffers** — 4 KiB, 16 KiB, 64 KiB and 256 KiB, with tails of 1, 37 and 63 bytes.
+  These run the four-block unrolled loop thousands of times rather than the handful the rest of
+  the suite manages, which is as close as the tests come to what the benchmarks measure.
+- Both word entry points over 0–40 words, and at the same thirty lengths straddling the
+  engagement threshold, the unrolled loop, its remainder and the sub-block tail.
+- **Both incremental paths against each other** — `AppendBytes` and the package's `Append` over
+  thirteen chunks that align to neither words nor blocks, compared after every one.
+- **Arbitrary parameters** — the random sets from the test above, restricted to those the
+  package can express.
+
+Mutation confirms they are not decorative: making the four-block fold constant off by one
+fails 73 of the 98.
+
+<details>
+<summary>The one place the two parameter models disagree</summary>
+
+`Crc32ParameterSet` collapses input and output reflection into a single flag, so a set
+reflecting one but not the other has no equivalent — those are skipped, and the reference
+model remains the only oracle covering them. That much was evident from the signature.
+
+The other difference was not, and the random-parameter test is what found it. **For a
+reflected set, the package's `initialValue` is the register to start from, not the catalogue's
+`Init`.** This library follows the catalogue, where `Init` is stated in the unreflected domain
+and a reflected engine starts from its bit reversal — the distinction
+[`InitialRegister`](#api) exists to express. Handing `Init` over unreversed disagrees on every
+reflected input.
+
+Every catalogued CRC-32 hides this. All seven reflected presets here initialise to
+`0xFFFFFFFF` or `0x00000000`, and a bit-reversal palindrome cannot tell the two conventions
+apart — which is why the twelve check values pass under either reading, and why nothing short
+of random parameters was going to surface it. Verified against Williams' model directly across
+20,000 random sets: this library matches it on all of them, the package on all of them once
+the reversal is applied and essentially none of them without.
+
+Neither convention is wrong; they are different parameterisations that agree on every CRC
+anyone has catalogued. The translation is applied where the parameter sets are built, and
+`ReflectedInitialValue_IsTakenInTheReflectedDomain` pins it so a change of convention on either
+side surfaces as one clear failure rather than as noise across the cross-checks.
+</details>
+
+One caveat worth stating plainly: `System.IO.Hashing` 11.0 declares `net10.0` as its lowest
+supported target and warns when referenced from `net8.0`. The `netstandard2.0` asset that
+resolves instead is wanted here rather than merely tolerated, for the independence described
+above, so the warning is suppressed in the test project — but not taken on trust. The
+check-value anchor runs on that exact target framework, so an unsupported configuration that
+stopped working would fail the suite rather than quietly weaken an oracle.
 
 ## Benchmarks
 
@@ -773,10 +842,10 @@ come back.
 `System.IO.Hashing` 11.0 — pre-release at the time of writing — gives `Crc32` a configurable
 parameter set for the first time. Until then the type computed ISO-HDLC and nothing else, so
 there was no overlap worth timing outside a single preset. `Crc32ParameterSet.Create` now takes
-a polynomial, an initial value, a final XOR and a reflection flag: the same Rocksoft model this
-library uses, with input and output reflection collapsed into one flag. All twelve presets here
-map onto it unchanged and return their catalogued check values through it, so the two really
-are answering the same question.
+a polynomial, an initial value, a final XOR and a reflection flag: near enough the Rocksoft
+model this library uses, differing in [two ways](#a-second-oracle) that all twelve presets map
+across cleanly. Run through it, each returns its catalogued check value, so the two really are
+answering the same question.
 
 `SystemIoHashingBenchmarks` runs both over the same buffer. Measured on .NET 10.0.11, default
 job, same machine as every table above — sizes across the top this time, because there are
@@ -905,7 +974,9 @@ CustomCrc32.slnx                  Solution (new-style XML format)
 
 Package versions: NUnit 4.6.1, NUnit3TestAdapter 6.2.0, Microsoft.NET.Test.Sdk 18.8.1,
 coverlet.collector 10.0.1, BenchmarkDotNet 0.15.8, System.IO.Hashing
-11.0.0-preview.7.26381.103 (benchmarks only, and only in the `net10.0` build).
+11.0.0-preview.7.26381.103 — the last in the test project, where it is
+[a second oracle](#a-second-oracle), and in the benchmarks' `net10.0` build, where it is
+[the thing being measured against](#against-systemiohashing).
 
 ## Commands
 

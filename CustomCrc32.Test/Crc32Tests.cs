@@ -1,5 +1,7 @@
 using System.Buffers.Binary;
 using System.Runtime.Intrinsics.X86;
+using Crc32ParameterSet = System.IO.Hashing.Crc32ParameterSet;
+using HashingCrc32 = System.IO.Hashing.Crc32;
 
 namespace CustomCrc32.Test;
 
@@ -641,6 +643,304 @@ public class Crc32Tests
 
         Assert.That(results, Is.Unique);
     }
+
+    // ------------------------------------------------- second oracle: the BCL's
+
+    // System.IO.Hashing 11.0 takes a configurable parameter set, so for the first time there
+    // is a second implementation covering the same ground rather than one preset of it. It is
+    // an unusually good oracle here: written by other people, from the catalogue rather than
+    // from this code, and — on this net8.0 target, which resolves the package's netstandard2.0
+    // asset — carrying no hardware intrinsics at all. So these tests hold a carry-less
+    // multiply fold against something that does not fold, which is the comparison worth having.
+    //
+    // Where the machine lacks PCLMULQDQ or SSSE3 they still pass, having compared two
+    // non-folding implementations instead; the assertion messages carry
+    // Crc32.IsHardwareAccelerated so a failure says which path was actually in play.
+
+    /// <summary>
+    /// Anchors the second oracle exactly as <see cref="Presets"/> anchors the first: the
+    /// package, driven through a parameter set built from this library's, must reproduce the
+    /// published check value. Passing means the parameter models really do line up — that
+    /// this library's normal-form polynomial, initial value and final XOR mean the same
+    /// things to <c>Crc32ParameterSet.Create</c> — which every test below depends on and
+    /// none of them would otherwise establish.
+    /// </summary>
+    [TestCaseSource(nameof(Presets))]
+    public void Preset_SystemIoHashing_OverCheckString_ReturnsPublishedCheckValue(Preset preset)
+    {
+        Assert.That(SystemIoHashing(preset.Parameters, "123456789"u8), Is.EqualTo(preset.CheckValue));
+    }
+
+    /// <summary>
+    /// Every length from empty to five blocks, which sweeps the sub-threshold case, the fold
+    /// threshold itself, whole and partial blocks, and all four possible byte tails.
+    /// </summary>
+    [TestCaseSource(nameof(Presets))]
+    public void Preset_ComputeBytes_MatchesSystemIoHashing(Preset preset)
+    {
+        Random random = new(31415926);
+
+        for (int length = 0; length <= 80; length++)
+        {
+            byte[] data = RandomBytes(random, length);
+
+            Assert.That(
+                preset.Instance.ComputeBytes(data),
+                Is.EqualTo(SystemIoHashing(preset.Parameters, data)),
+                Context($"{preset.Name}, length {length}"));
+        }
+    }
+
+    [TestCaseSource(nameof(Presets))]
+    public void Preset_ComputeBytes_LengthsAroundFoldingBoundaries_MatchSystemIoHashing(Preset preset)
+    {
+        Random random = new(2718281);
+
+        foreach (int length in (int[])[31, 32, 33, 63, 64, 65, 95, 96, 127, 128, 129, 255, 257, 511, 1021, 1022, 1023, 1024])
+        {
+            byte[] data = RandomBytes(random, length);
+
+            Assert.That(
+                preset.Instance.ComputeBytes(data),
+                Is.EqualTo(SystemIoHashing(preset.Parameters, data)),
+                Context($"{preset.Name}, length {length}"));
+        }
+    }
+
+    /// <summary>
+    /// Inputs long enough to run the four-way unrolled loop thousands of times rather than the
+    /// handful the fixture's other lengths manage, with tails of 1, 37 and 63 bytes so the
+    /// bulk and the mop-up are both under load. This is the closest the suite comes to what
+    /// the benchmarks measure.
+    /// </summary>
+    [TestCaseSource(nameof(Presets))]
+    public void Preset_LargeBuffers_MatchSystemIoHashing(Preset preset)
+    {
+        Random random = new(20260815);
+
+        foreach (int length in (int[])[4_096, 16_384 + 1, 65_536 + 37, 262_144 + 63])
+        {
+            byte[] data = RandomBytes(random, length);
+
+            Assert.That(
+                preset.Instance.ComputeBytes(data),
+                Is.EqualTo(SystemIoHashing(preset.Parameters, data)),
+                Context($"{preset.Name}, length {length}"));
+        }
+    }
+
+    [TestCaseSource(nameof(Presets))]
+    public void Preset_ComputeBigEndian_MatchesSystemIoHashingOverBigEndianBytes(Preset preset)
+    {
+        Random random = new(20250811);
+
+        for (int length = 0; length <= 40; length++)
+        {
+            uint[] data = RandomWords(random, length);
+
+            Assert.That(
+                preset.Instance.ComputeBigEndian(data),
+                Is.EqualTo(SystemIoHashing(preset.Parameters, ToBigEndianBytes(data))),
+                Context($"{preset.Name}, length {length}"));
+        }
+    }
+
+    [TestCaseSource(nameof(Presets))]
+    public void Preset_ComputeLittleEndian_MatchesSystemIoHashingOverLittleEndianBytes(Preset preset)
+    {
+        Random random = new(20250811);
+
+        for (int length = 0; length <= 40; length++)
+        {
+            uint[] data = RandomWords(random, length);
+
+            Assert.That(
+                preset.Instance.ComputeLittleEndian(data),
+                Is.EqualTo(SystemIoHashing(preset.Parameters, ToLittleEndianBytes(data))),
+                Context($"{preset.Name}, length {length}"));
+        }
+    }
+
+    /// <summary>
+    /// The word entry points at the lengths that straddle every boundary the folding path
+    /// has, both byte orders, against the second oracle.
+    /// </summary>
+    [TestCaseSource(nameof(Presets))]
+    public void Preset_LengthsAroundFoldingBoundaries_MatchSystemIoHashing(Preset preset)
+    {
+        Random random = new(777);
+
+        foreach (int length in FoldingBoundaryLengths)
+        {
+            uint[] data = RandomWords(random, length);
+
+            Assert.That(
+                preset.Instance.ComputeBigEndian(data),
+                Is.EqualTo(SystemIoHashing(preset.Parameters, ToBigEndianBytes(data))),
+                Context($"{preset.Name}, big-endian, length {length}"));
+
+            Assert.That(
+                preset.Instance.ComputeLittleEndian(data),
+                Is.EqualTo(SystemIoHashing(preset.Parameters, ToLittleEndianBytes(data))),
+                Context($"{preset.Name}, little-endian, length {length}"));
+        }
+    }
+
+    /// <summary>
+    /// Both libraries' incremental paths over the same chunk boundaries. The chunks are
+    /// deliberately unaligned to words and to blocks, so each call folds what it can and
+    /// carries the rest, and the two must still agree at the end and at every point along
+    /// the way.
+    /// </summary>
+    [TestCaseSource(nameof(Presets))]
+    public void Preset_AppendBytesInChunks_MatchesSystemIoHashingIncremental(Preset preset)
+    {
+        byte[] data = RandomBytes(new Random(8675309), 5_000);
+        HashingCrc32 hashing = new(HashingParameterSet(preset.Parameters)!);
+
+        uint register = preset.Instance.InitialRegister;
+        int offset = 0;
+
+        foreach (int chunk in (int[])[0, 1, 3, 31, 32, 33, 63, 64, 65, 127, 500, 1_021, 3_060])
+        {
+            register = preset.Instance.AppendBytes(register, data.AsSpan(offset, chunk));
+            hashing.Append(data.AsSpan(offset, chunk));
+            offset += chunk;
+
+            Assert.That(
+                preset.Instance.Finish(register),
+                Is.EqualTo(hashing.GetCurrentHashAsUInt32()),
+                Context($"{preset.Name}, after {offset} bytes"));
+        }
+
+        Assert.That(offset, Is.EqualTo(data.Length), "the chunk sizes should consume the buffer exactly");
+    }
+
+    /// <summary>
+    /// Random parameter sets, restricted to the ones the second oracle can express.
+    /// <c>Crc32ParameterSet</c> carries a single reflection flag, so sets reflecting input but
+    /// not output — or the reverse — have no equivalent and are skipped; the reference model
+    /// in this fixture remains the only oracle covering those, which is why it stays.
+    /// </summary>
+    [Test]
+    public void ArbitraryParameters_ComputeBytes_MatchSystemIoHashing()
+    {
+        Random random = new(20260811);
+        int compared = 0;
+
+        for (int trial = 0; trial < 400; trial++)
+        {
+            Crc32Parameters parameters = new(
+                Polynomial: RandomWord(random),
+                InitialValue: RandomWord(random),
+                ReflectInput: random.Next(2) == 0,
+                ReflectOutput: random.Next(2) == 0,
+                XorOut: RandomWord(random));
+
+            // Spans both sides of the 32-byte folding threshold and every tail remainder.
+            byte[] data = RandomBytes(random, random.Next(0, 200));
+
+            if (HashingParameterSet(parameters) is not { } parameterSet)
+            {
+                continue;
+            }
+
+            compared++;
+            Assert.That(
+                new Crc32(parameters).ComputeBytes(data),
+                Is.EqualTo(HashingCrc32.HashToUInt32(parameterSet, data)),
+                Context($"{parameters} over {data.Length} bytes"));
+        }
+
+        // Roughly half the trials should survive the filter. Asserting it keeps a change to
+        // the mapping from quietly turning this test into a loop that compares nothing.
+        Assert.That(compared, Is.GreaterThan(100), "too few parameter sets were expressible to be meaningful");
+    }
+
+    /// <summary>
+    /// This library's parameter set expressed as the package's, or <see langword="null"/>
+    /// where it cannot be. The polynomial's normal form and the final XOR mean the same thing
+    /// to both. Two things do not, and both are translated here rather than worked around.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The package carries one reflection flag where this library carries two, so a set
+    /// reflecting input but not output — or the reverse — has no equivalent at all and is the
+    /// case this returns <see langword="null"/> for. The reference model above stays the only
+    /// oracle covering those, which is why it stays.
+    /// </para>
+    /// <para>
+    /// The initial value differs in meaning. This library follows the catalogue, where
+    /// <c>Init</c> is stated in the unreflected domain and a reflected engine starts from its
+    /// bit reversal — the distinction <see cref="Crc32.InitialRegister"/> exists to express.
+    /// <c>Crc32ParameterSet.Create</c> instead takes the register to start from directly, so a
+    /// reflected set needs the reversal applied before it is handed over. Every catalogued
+    /// CRC-32 hides this: all seven reflected presets initialise to <c>0xFFFFFFFF</c> or
+    /// <c>0x00000000</c>, and a bit-reversal palindrome cannot tell the two conventions apart.
+    /// Random parameters can, which is how it came to light;
+    /// <see cref="ReflectedInitialValue_IsTakenInTheReflectedDomain"/> pins it.
+    /// </para>
+    /// <para>
+    /// The reversal uses this fixture's own loop-based <see cref="ReverseWord"/> rather than
+    /// <see cref="Crc32.InitialRegister"/>, which would be the same value by definition and
+    /// would make the oracle depend on the code under test.
+    /// </para>
+    /// </remarks>
+    private static Crc32ParameterSet? HashingParameterSet(Crc32Parameters parameters) =>
+        parameters.ReflectInput == parameters.ReflectOutput
+            ? Crc32ParameterSet.Create(
+                parameters.Polynomial,
+                parameters.ReflectInput ? ReverseWord(parameters.InitialValue) : parameters.InitialValue,
+                parameters.XorOut,
+                parameters.ReflectInput)
+            : null;
+
+    /// <summary>
+    /// Pins the one place the two parameter models disagree, so that the translation in
+    /// <see cref="HashingParameterSet"/> is documented by a failing test rather than by a
+    /// comment alone, and so that a future change of convention on either side surfaces here
+    /// instead of as a mystery in the cross-checks.
+    /// </summary>
+    [Test]
+    public void ReflectedInitialValue_IsTakenInTheReflectedDomain()
+    {
+        // Reflected, and an initial value that is not a bit-reversal palindrome — which every
+        // catalogued CRC-32's is, which is why no preset can show this.
+        Crc32Parameters parameters = new(0x04C11DB7, 0x0000FFFF, ReflectInput: true, ReflectOutput: true, 0);
+        byte[] data = RandomBytes(new Random(20260815), 64);
+
+        uint ours = new Crc32(parameters).ComputeBytes(data);
+
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(
+                HashingCrc32.HashToUInt32(
+                    Crc32ParameterSet.Create(parameters.Polynomial, ReverseWord(parameters.InitialValue), parameters.XorOut, reflectValues: true),
+                    data),
+                Is.EqualTo(ours),
+                "the package starts from the register, so the catalogue's Init needs reversing");
+
+            Assert.That(
+                HashingCrc32.HashToUInt32(
+                    Crc32ParameterSet.Create(parameters.Polynomial, parameters.InitialValue, parameters.XorOut, reflectValues: true),
+                    data),
+                Is.Not.EqualTo(ours),
+                "passing Init through unreversed should not happen to agree");
+        }
+    }
+
+    private static uint SystemIoHashing(Crc32Parameters parameters, ReadOnlySpan<byte> data) =>
+        HashingCrc32.HashToUInt32(
+            HashingParameterSet(parameters)
+                ?? throw new InvalidOperationException($"{parameters} has no Crc32ParameterSet equivalent"),
+            data);
+
+    /// <summary>
+    /// Names the path that was actually running, since these tests compare against a
+    /// non-folding oracle whether or not this machine folds.
+    /// </summary>
+    private static string Context(string what) =>
+        $"{what} (IsHardwareAccelerated: {Crc32.IsHardwareAccelerated})";
 
     // ------------------------------------------------------------------ oracle
 
