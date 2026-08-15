@@ -31,7 +31,9 @@ uint ofFile = Crc32.IsoHdlc.ComputeBytes(File.ReadAllBytes("payload.bin"));
 
 ## Requirements
 
-- .NET 8.0 or newer at runtime. All three projects target `net8.0`.
+- .NET 8.0 or newer at runtime. The library and its tests target `net8.0`; the benchmark
+  project additionally builds for `net10.0`, for [one comparison](#against-systemiohashing)
+  whose dependency ships its accelerated code no lower.
 - **Building through `CustomCrc32.slnx` needs a newer SDK than 8.0.** The `.slnx` solution
   format postdates the 8.0 CLI, which cannot parse it; CI installs the 10.0 SDK for exactly
   that reason, and development is on 10.0.303. With an older SDK, build the individual
@@ -523,7 +525,7 @@ else**, which is exactly the gap those tests exist to close.
 
 ## Benchmarks
 
-[`CustomCrc32.Benchmarks`](CustomCrc32.Benchmarks/) holds three sets, each answering a
+[`CustomCrc32.Benchmarks`](CustomCrc32.Benchmarks/) holds five sets, each answering a
 different question:
 
 - **`Crc32Benchmarks`** — the fold against two slower formulations, one bit at a time and one
@@ -536,6 +538,9 @@ different question:
 - **`Crc32cHardwareBenchmarks`** — the fold against SSE4.2's dedicated `CRC32` instruction,
   both producing CRC-32C, which is [the one comparison](#against-the-dedicated-crc-instruction)
   where the library is at a structural disadvantage.
+- **`SystemIoHashingBenchmarks`** — the fold against `System.IO.Hashing` 11.0, which gained a
+  configurable parameter set and so [covers the same ground](#against-systemiohashing) for the
+  first time. Built for `net10.0` only, for the reason given there.
 
 Baselines that the library does not expose are reimplemented inside the benchmark — the table
 formulations in the first set, the other lane counts in `FoldLanes` — since the library folds
@@ -552,7 +557,15 @@ no built-in throughput column, and `OperationsPerInvoke` cannot be used here bec
 requires a compile-time constant.
 
 ```
-dotnet run -c Release --project CustomCrc32.Benchmarks
+dotnet run -c Release -f net8.0 --project CustomCrc32.Benchmarks
+```
+
+The project multi-targets, so `dotnet run` needs to be told which framework. Everything below
+was measured on `net8.0` except [the `System.IO.Hashing` comparison](#against-systemiohashing),
+which only exists in the `net10.0` build:
+
+```
+dotnet run -c Release -f net10.0 --project CustomCrc32.Benchmarks
 ```
 
 Extra arguments are forwarded to BenchmarkDotNet (`-- --job short`, `--filter`, …). Every
@@ -560,7 +573,7 @@ class runs by default, which includes the streaming set — that one allocates *
 takes several minutes, so narrow the run when you do not want it:
 
 ```
-dotnet run -c Release --project CustomCrc32.Benchmarks -- --filter '*FoldLaneBenchmarks*'
+dotnet run -c Release -f net8.0 --project CustomCrc32.Benchmarks -- --filter '*FoldLaneBenchmarks*'
 ```
 
 ### Indicative results
@@ -755,6 +768,90 @@ the diagnosis. Both the fix and the reason are commented in `Crc32cHardware.cs` 
 come back.
 </details>
 
+### Against `System.IO.Hashing`
+
+`System.IO.Hashing` 11.0 — pre-release at the time of writing — gives `Crc32` a configurable
+parameter set for the first time. Until then the type computed ISO-HDLC and nothing else, so
+there was no overlap worth timing outside a single preset. `Crc32ParameterSet.Create` now takes
+a polynomial, an initial value, a final XOR and a reflection flag: the same Rocksoft model this
+library uses, with input and output reflection collapsed into one flag. All twelve presets here
+map onto it unchanged and return their catalogued check values through it, so the two really
+are answering the same question.
+
+`SystemIoHashingBenchmarks` runs both over the same buffer. Measured on .NET 10.0.11, default
+job, same machine as every table above — sizes across the top this time, because there are
+eight series. Throughput, higher is better:
+
+| Series                                       | 4 KiB (L1)     | 64 KiB (L2)    | 1 MiB (L3)     | 16 MiB (past L3) |
+| -------------------------------------------- | -------------- | -------------- | -------------- | ---------------- |
+| **Fold, ISO-HDLC**                           | 21.31 GB/s     | **23.70 GB/s** | **22.91 GB/s** | 15.23 GB/s       |
+| **Fold, CRC-32C**                            | 21.51 GB/s     | 23.68 GB/s     | 22.84 GB/s     | 15.25 GB/s       |
+| **Fold, AUTOSAR**                            | 21.38 GB/s     | 23.57 GB/s     | 22.90 GB/s     | 15.21 GB/s       |
+| `System.IO.Hashing`, ISO-HDLC, parameterless | 21.78 GB/s     | 22.42 GB/s     | 22.52 GB/s     | **15.60 GB/s**   |
+| `System.IO.Hashing`, ISO-HDLC, built set     | 22.04 GB/s     | 22.36 GB/s     | 22.44 GB/s     | 15.54 GB/s       |
+| `System.IO.Hashing`, CRC-32C, package preset | 21.95 GB/s     | 22.38 GB/s     | 22.46 GB/s     | 15.54 GB/s       |
+| `System.IO.Hashing`, CRC-32C, built set      | **22.25 GB/s** | 22.37 GB/s     | 22.49 GB/s     | 15.57 GB/s       |
+| `System.IO.Hashing`, AUTOSAR, built set      | 22.21 GB/s     | 22.36 GB/s     | 22.48 GB/s     | 15.46 GB/s       |
+
+**The two are level.** No difference in that table exceeds 6%, and the lead changes hands
+with the working set: the package is ~2% ahead at 4 KiB and ~2% ahead past L3, the fold ~6%
+ahead at 64 KiB and ~2% at 1 MiB. That is the expected result rather than a surprising one.
+Both are carry-less multiply folds, and the ceiling they are pressed against is the port the
+multiplies contend for, not anything either author chose — [fold lanes](#fold-lanes) works out
+where that ceiling comes from. Two independent implementations arriving within a few percent
+is the strongest evidence available that the number is the machine's and not the code's.
+
+**Neither implementation cares which polynomial it is given.** Reading down the fold's three
+rows, the spread across ISO-HDLC, CRC-32C and AUTOSAR is under 1% at every size; the package's
+five rows spread by at most 2.2%, and only at 4 KiB where the measurement is tightest. A
+general CRC-32 has no reason to be slower for an unusual polynomial, and neither library is.
+
+**Configurability costs nothing on either side.** The package's parameterless entry point and a
+hand-built parameter set describing the identical CRC land within 1.2% of each other, in both
+directions across the four sizes. Taking the general API is not paying for generality.
+
+**The package does not reach for SSE4.2 either.** Its CRC-32C preset — the one parameter set
+where the hardware instruction applies, and the only place a special case could hide — matches
+its hand-built equivalent to within 1.4%, and matches its own ISO-HDLC and AUTOSAR rows just as
+closely. It folds CRC-32C like everything else. That is independent corroboration of
+[the previous section](#against-the-dedicated-crc-instruction), reached by a different route:
+given the instruction, a second implementation also declined to use it.
+
+**Both are allocation-free.** `MemoryDiagnoser` reports zero bytes for all eight series.
+
+Worth keeping the gaps in proportion: the largest here is 6%, while [skipping the identity
+`pshufb`](#going-further) is already measured at 16–20% cache-resident on this library's own
+kernel. Both sides are nearer each other than either is to its own remaining headroom, so
+these columns are not the basis on which to choose.
+
+The honest summary for a caller: if you are on .NET 10 or newer, can take a pre-release
+dependency, and want one of the CRCs `Crc32ParameterSet` can express, the BCL now does this at
+the same speed with nothing third-party involved. What is still here and not there is a
+`net8.0` target, a stable version, twelve named presets against two, `ReflectInput` and
+`ReflectOutput` as separate parameters, word-oriented entry points that take
+`ReadOnlySpan<uint>` with the byte order named at the call site, and an incremental API that
+threads a bare `uint` register rather than an object to allocate and reset.
+
+<details>
+<summary>Why this one benchmark builds for <code>net10.0</code></summary>
+
+The package ships its vectorised implementation in its `net10.0` and `net11.0` assets only. A
+`net8.0` consumer silently resolves the `netstandard2.0` asset instead, which contains no
+hardware intrinsics at all — no `Pclmulqdq`, no `Vector128`, nothing that would fold.
+
+Nothing warns you. The build succeeds, the answers are correct, and the throughput column
+quietly reports a different algorithm than the one you meant to measure. Timing against it
+would have produced a flattering result for this library that said nothing about either
+implementation, only about which asset NuGet picked.
+
+Hence `<TargetFrameworks>net8.0;net10.0</TargetFrameworks>` on the benchmark project, the
+package referenced under `net10.0` alone, and `SystemIoHashingBenchmarks` behind
+`#if NET10_0_OR_GREATER` so a `net8.0` run cannot include it by accident. Everything else in
+this README stays reproducible on `net8.0`. The runtime change is not itself doing anything to
+the figures: the fold's rows above sit within about 1% of the same measurements taken on
+.NET 8.0.30 in the previous section.
+</details>
+
 ### Going further
 
 Nothing here is the ceiling.
@@ -801,22 +898,26 @@ CustomCrc32.slnx                  Solution (new-style XML format)
     ├── StreamingBenchmarks.cs       1 GiB cold, against a pure-read roofline
     ├── Crc32cHardware.cs            CRC-32C via SSE4.2, one chain and three
     ├── Crc32cHardwareBenchmarks.cs  The fold against the dedicated CRC instruction
+    ├── SystemIoHashingBenchmarks.cs The fold against System.IO.Hashing 11.0 (net10.0 only)
     ├── ThroughputColumn.cs
     └── Program.cs
 ```
 
 Package versions: NUnit 4.6.1, NUnit3TestAdapter 6.2.0, Microsoft.NET.Test.Sdk 18.8.1,
-coverlet.collector 10.0.1, BenchmarkDotNet 0.15.8.
+coverlet.collector 10.0.1, BenchmarkDotNet 0.15.8, System.IO.Hashing
+11.0.0-preview.7.26381.103 (benchmarks only, and only in the `net10.0` build).
 
 ## Commands
 
 ```bash
-dotnet build CustomCrc32.slnx                              # build
-dotnet test  CustomCrc32.slnx                              # run tests
-dotnet run -c Release --project CustomCrc32.Benchmarks     # run benchmarks
+dotnet build CustomCrc32.slnx                                       # build
+dotnet test  CustomCrc32.slnx                                       # run tests
+dotnet run -c Release -f net8.0 --project CustomCrc32.Benchmarks    # run benchmarks
 ```
 
 The two solution-level commands need an SDK that understands `.slnx` — see
 [Requirements](#requirements). Point them at the individual `.csproj` files on an older one.
 
-Benchmarks must be run against a Release build; BenchmarkDotNet will refuse otherwise.
+Benchmarks must be run against a Release build; BenchmarkDotNet will refuse otherwise. The
+benchmark project multi-targets, so `dotnet run` needs `-f` — use `-f net10.0` for
+[the `System.IO.Hashing` comparison](#against-systemiohashing), `-f net8.0` for the rest.

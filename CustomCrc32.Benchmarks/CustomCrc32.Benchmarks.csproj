@@ -1,14 +1,29 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
     <OutputType>Exe</OutputType>
-    <TargetFramework>net8.0</TargetFramework>
+    <!--
+      net8.0 is the framework the library targets and the one every other benchmark here is
+      quoted against. net10.0 exists for the System.IO.Hashing comparison alone: that package
+      only ships its vectorised implementation in its net10.0 and net11.0 assets, and a net8.0
+      consumer silently resolves the netstandard2.0 asset, which has no intrinsics at all.
+      Measuring against that would compare target frameworks rather than implementations.
+    -->
+    <TargetFrameworks>net8.0;net10.0</TargetFrameworks>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
   </PropertyGroup>
 
   <ItemGroup>
     <PackageReference Include="BenchmarkDotNet" Version="0.15.8" />
+  </ItemGroup>
+
+  <!--
+    Pre-release, because the configurable parameter set this compares against is new in 11.0
+    and has not shipped in a stable version yet.
+  -->
+  <ItemGroup Condition="'$(TargetFramework)' == 'net10.0'">
+    <PackageReference Include="System.IO.Hashing" Version="11.0.0-preview.7.26381.103" />
   </ItemGroup>
 
   <ItemGroup>
