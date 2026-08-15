@@ -12,8 +12,10 @@ inheriting the host's. `ComputeBytes` covers the ordinary case — a file, a pac
 message — at any length.
 
 Runs at **~21 GB/s** on x86-64 with carry-less multiply, for every parameter set rather than
-a privileged few, falling back to a table where the instructions are unavailable. Every entry
-point is allocation-free and reads the caller's buffer in place.
+a privileged few, falling back to a table where the instructions are unavailable. That figure
+is for data already in cache; over a stream arriving from memory it is ~15 GB/s, which is
+[most of what the memory system will give one core](#streaming-versus-resident-data). Every
+entry point is allocation-free and reads the caller's buffer in place.
 
 ```csharp
 using CustomCrc32;
@@ -305,7 +307,9 @@ parameters and not merely the presets. For folding *n* bits ahead:
   the `<< 1` is the bit-reversal of a product landing one place over.
 
 Four independent accumulators run at once, so the multiply's latency overlaps instead of
-stalling a single chain, and they are combined with single-block constants at the end.
+stalling a single chain, and they are combined with single-block constants at the end — see
+[four accumulator lanes](#four-accumulator-lanes) for why four, and why four statements in a
+row run faster than one.
 
 Loading a block needs at most one `pshufb`, and which permutation depends on both the engine
 and the requested byte order — reflected plus little-endian is already in the right order and
@@ -319,6 +323,74 @@ register means.
 
 A sanity check on the derivation: for polynomial `0x04C11DB7` reflected, it produces
 `0x1751997d0` and `0xccaa009e` — the constants published for zlib.
+
+### Four accumulator lanes
+
+The inner loop of `FoldBlocks` is four ordinary statements in a row:
+
+```csharp
+accumulator = FoldBlock(accumulator, _foldByFourBlocks, LoadBlock(ref source, next,     shuffle));
+second      = FoldBlock(second,      _foldByFourBlocks, LoadBlock(ref source, next + 1, shuffle));
+third       = FoldBlock(third,       _foldByFourBlocks, LoadBlock(ref source, next + 2, shuffle));
+fourth      = FoldBlock(fourth,      _foldByFourBlocks, LoadBlock(ref source, next + 3, shuffle));
+```
+
+Nothing there is parallel in any sense C# expresses. No threads, no wider vectors, and four
+times as much work per iteration. It is nevertheless about **three times faster** than folding
+one block at a time — and the reason is what these statements *do not* do.
+
+**Read what each line depends on.** No statement reads a value another statement in the same
+iteration writes. `second` does not wait on `accumulator`; `third` waits on neither. The
+dependency edges run *vertically*, through iterations — `accumulator` this time round needs
+`accumulator` from the last — and never *horizontally* within one. They are four disjoint
+chains threaded through a shared loop body.
+
+That is what makes the difference, because `PCLMULQDQ` is **pipelined**: it takes around seven
+cycles to produce a result, but a new one can be started every cycle. Processors execute out
+of order, issuing any instruction whose inputs are ready rather than waiting its turn in
+program order — so the second line's multiply starts the cycle after the first line's, not
+seven cycles later. The four loads are likewise independent and run ahead of all of it.
+
+The contrast is in the same file. The remainder loop just below folds one block at a time, and
+each of its iterations must wait for the previous result: about ten cycles per block — the
+multiply, then the two XORs hanging off it — with the multiplier idle for eight of them. Four
+lanes retire four blocks in those same ten cycles.
+
+**Why four and not sixteen.** The gain stops because the bottleneck moves. On this
+microarchitecture `PCLMULQDQ` and `PSHUFB` issue to the *same* execution port, so every block
+costs three slots on it: one permutation and two multiplies. Four lanes demand twelve slots
+per iteration against a ten-cycle chain — just past the point where the port rather than the
+latency is the limit. Three lanes would leave it partly idle; eight cannot make a saturated
+port go faster. Four is the smallest lane count that fills it.
+
+Both halves of that are measured rather than assumed — [fold lanes](#fold-lanes) below. Two
+lanes come in within a few percent of 2.00×, the signature of a loop still bound by latency
+with room to spare. Eight lanes stay within 3% of four either way on cached data, and lose at
+4 KiB where the longer merge is amortised over fewer blocks. And removing the identity
+`pshufb` — one of the three port slots, doing no work at all — is worth 16–20%, which a
+latency-bound loop would not have noticed.
+
+**Recombining the lanes.** After the loop, lane *i* holds blocks *i*, *i*+4, *i*+8, … folded
+together with the four-block constant, and the four lanes sit exactly one block apart in the
+message. Each merge step multiplies by x¹²⁸ and adds the next lane:
+
+```
+accumulator ← A₀·x¹²⁸ + A₁
+accumulator ← A₀·x²⁵⁶ + A₁·x¹²⁸ + A₂
+accumulator ← A₀·x³⁸⁴ + A₁·x²⁵⁶ + A₂·x¹²⁸ + A₃
+```
+
+That last line is precisely the residue of the interleaved message: each of lane 0's blocks
+sits three block positions ahead of lane 3's, lane 1's two, lane 2's one. The staggering is
+undone exactly, and nothing is reduced to 32 bits along the way — the accumulator stays merely
+congruent to the message right up to the final reduction.
+
+Two details fall out of this shape. The incoming register seeds **lane 0 only**, because it
+conceptually prepends to the message, and block 0 is where the message starts. And the
+`blocks >= 4` guard is a *seeding* requirement, not a loop requirement: between four and seven
+blocks the loop body never executes at all, but the lanes are still seeded, still merged, and
+the by-one remainder loop still mops up — which is why the boundary tests cover those lengths
+specifically.
 
 ### The table
 
@@ -444,25 +516,43 @@ else**, which is exactly the gap those tests exist to close.
 
 ## Benchmarks
 
-[`CustomCrc32.Benchmarks`](CustomCrc32.Benchmarks/) compares the shipping implementation
-against the two formulations it replaced — one bit at a time, and one table lookup per byte —
-across input sizes chosen to sit at different levels of the memory hierarchy. The table
-baselines are reimplemented inside the benchmark rather than called through the library,
-since the library now folds automatically and there is no supported way to ask it not to.
-`GlobalSetup` throws if any two paths that should agree have diverged — a speed comparison
-stops meaning anything once the baseline is wrong. That check covers `ComputeBytes` too: the
-byte buffer holds the big-endian serialisation of the same words, so it must return what
-`Compute` does.
+[`CustomCrc32.Benchmarks`](CustomCrc32.Benchmarks/) holds three sets, each answering a
+different question:
 
-`ThroughputColumn` is a custom `IColumn` adding a GB/s column derived from the mean and the
-`WordCount` parameter. BenchmarkDotNet has no built-in throughput column, and
-`OperationsPerInvoke` cannot be used here because it requires a compile-time constant.
+- **`Crc32Benchmarks`** — the shipping implementation against the two formulations it
+  replaced, one bit at a time and one table lookup per byte, across input sizes at different
+  levels of the memory hierarchy.
+- **`FoldLaneBenchmarks`** — the fold kernel at one, two, four and eight accumulator lanes
+  over a cache-resident buffer, which is what pins down [why four](#four-accumulator-lanes).
+- **`StreamingBenchmarks`** — 1 GiB in 1 MiB calls, each megabyte met for the first time,
+  against a pure-read roofline and a resident-buffer control. This is the streaming rate, and
+  it is not the same number as the one above.
+
+Baselines that the library does not expose are reimplemented inside the benchmark — the table
+formulations in the first set, the other lane counts in `FoldLanes` — since the library folds
+by four automatically and offers no supported way to ask for anything else. Every one of them
+is checked before it is timed: `GlobalSetup` throws if any two paths that should agree have
+diverged, because a speed comparison stops meaning anything once a baseline is wrong. The lane
+variants are held against `Crc32.IsoHdlc.ComputeBytes`, the answer the test suite pins; the
+byte buffer in the first set holds the big-endian serialisation of the same words, so it must
+return what `Compute` does.
+
+`ThroughputColumn` is a custom `IColumn` adding a GB/s column derived from the mean and
+whichever length parameter the case declares — `WordCount` or `ByteCount`. BenchmarkDotNet has
+no built-in throughput column, and `OperationsPerInvoke` cannot be used here because it
+requires a compile-time constant.
 
 ```
 dotnet run -c Release --project CustomCrc32.Benchmarks
 ```
 
-Extra arguments are forwarded to BenchmarkDotNet (`-- --job short`, `--filter`, …).
+Extra arguments are forwarded to BenchmarkDotNet (`-- --job short`, `--filter`, …). Every
+class runs by default, which includes the streaming set — that one allocates **1 GiB** and
+takes several minutes, so narrow the run when you do not want it:
+
+```
+dotnet run -c Release --project CustomCrc32.Benchmarks -- --filter '*FoldLaneBenchmarks*'
+```
 
 ### Indicative results
 
@@ -483,8 +573,9 @@ baseline the fold replaced:
 | 262,144 (1 MiB)  | 34 MB/s  | 567 MB/s  | 636 MB/s   | 21.3 GB/s   | 21.5 GB/s   | 21.5 GB/s    | 21.5 GB/s    |
 
 **Folding is ~38× the table** at steady state and ~620× the bitwise loop. It reaches roughly
-5.7 bytes per cycle, which for a 4 KiB working set is bounded by carry-less multiply
-throughput rather than memory.
+5.7 bytes per cycle, which for a 4 KiB working set is bounded not by memory but by the
+execution port the carry-less multiplies share with the block permutation — about three slots
+on it per block, which [fold lanes](#fold-lanes) below takes apart.
 
 **Small inputs still gain.** At 64 bytes — the smallest size measured, and only two blocks
 above the engagement threshold — folding is around 4× the table. Below the threshold the
@@ -522,6 +613,86 @@ The 64-byte row looks like a 7% deficit but should not be read that way. At a ~2
 short job reports a 99.9% confidence interval of ±7 to ±14 ns, so that column says nothing
 either way; it is there for completeness, not as a finding.
 
+### Fold lanes
+
+`FoldLaneBenchmarks`, default job, same machine as above. The buffer is reused every
+invocation, so everything up to 1 MiB is served from cache and the pipeline is what is being
+measured. Throughput, higher is better:
+
+| Input             | 1 lane    | 2 lanes    | 4 lanes (shipping) | 8 lanes    | 4 lanes, no shuffle |
+| ----------------- | --------- | ---------- | ------------------ | ---------- | ------------------- |
+| 4 KiB (L1)        | 6.82 GB/s | 13.32 GB/s | 20.36 GB/s         | 19.74 GB/s | 23.79 GB/s          |
+| 64 KiB (L2)       | 6.92 GB/s | 14.49 GB/s | 23.86 GB/s         | 23.88 GB/s | 28.63 GB/s          |
+| 1 MiB (L3)        | 7.28 GB/s | 14.56 GB/s | 22.79 GB/s         | 23.48 GB/s | 26.54 GB/s          |
+| 16 MiB (past L3)  | 6.64 GB/s | 11.44 GB/s | 15.06 GB/s         | 16.08 GB/s | 16.40 GB/s          |
+
+**Four lanes are worth roughly 3–3.5× over one**, cache-resident, for four statements that
+look sequential and do four times the work per iteration. That is the whole case for the
+interleaving, and it is the largest single factor in the fold's speed after the choice to fold
+at all.
+
+**Two lanes land within a few percent of 2.00×** at every size. That number is the most
+informative one in the table: near-perfect linear scaling means the loop is still bound by
+*latency* at two lanes, with the multiplier port idle enough to absorb a second chain for
+free. Nothing else in the table scales that cleanly.
+
+**Eight lanes are not the improvement four more chains would suggest** — 3% slower than four
+at 4 KiB, where the seven-deep serial merge is amortised over only 256 blocks; a tie at
+64 KiB; and 3% ahead at 1 MiB, where hiding memory latency starts to matter more than feeding
+the port. The port is already full at four, so widening past it only lengthens the prologue
+and epilogue. Register pressure is not the reason it stops paying: eight accumulators, two
+constants and a mask still fit the sixteen `xmm` registers without spilling.
+
+**The identity `pshufb` costs 16–20%**, and this is the clearest evidence for what the kernel
+is bound by. That shuffle permutes nothing at all in the reflected byte case; removing it
+removes one micro-operation from the contended port and nothing else. A latency-bound loop
+would not have noticed. See [going further](#going-further).
+
+Past L3 the ordering changes character — the 16 MiB row is partly a memory measurement, which
+is what the next section is about.
+
+### Streaming versus resident data
+
+Every table above reuses one buffer. That is the right way to isolate the pipeline, and the
+wrong way to predict what a caller checksumming a file will see. `StreamingBenchmarks` does
+the other experiment: 1 GiB in 1 MiB calls, each megabyte met for the first time, against a
+resident-buffer control doing identical work.
+
+| Case (1 GiB of input, 1 MiB calls) | Mean      | Throughput | vs 1 lane |
+| ---------------------------------- | --------- | ---------- | --------- |
+| cold, 1 lane                       | 172.03 ms | 6.24 GB/s  | 1.00×     |
+| cold, 2 lanes                      | 95.14 ms  | 11.29 GB/s | 1.81×     |
+| **cold, 4 lanes (shipping)**       | 72.97 ms  | 14.72 GB/s | 2.36×     |
+| cold, 8 lanes                      | 69.10 ms  | 15.54 GB/s | 2.49×     |
+| cold, 4 lanes, shuffle removed     | 67.16 ms  | 15.99 GB/s | 2.56×     |
+| *cold, pure read (roofline)*       | 57.80 ms  | 18.58 GB/s | 2.98×     |
+| *hot 1 MiB ×1024, 4 lanes*         | 47.33 ms  | 22.69 GB/s | 3.63×     |
+
+The control is the check that these two experiments are measuring the same kernel: at 46.2 µs
+per megabyte it lands within 0.4% of the 1 MiB row in the lane table above.
+
+**The lane advantage compresses by about a third.** Four lanes over one is 3.0–3.4×
+cache-resident but **2.36×** on data arriving from memory. The pipeline figures are an upper
+bound, not a streaming rate, and this is the number to quote for a file or a socket.
+
+**The kernel is largely memory-bound while streaming.** It reaches 79% of a pure-read
+roofline — a loop that touches the same gigabyte and folds nothing. That caps every remaining
+compute optimisation at ~1.26× no matter how clever the kernel becomes. The clearest way to
+see it: the *hot* case at 22.69 GB/s beats even the *cold roofline* at 18.58 GB/s, so on cold
+data the fold is finishing early and waiting for lines to arrive.
+
+That roofline is itself well below DDR4-2666's ~41 GB/s theoretical, because one core can only
+keep so many line fills outstanding. It is a per-core limit rather than a platform one, which
+is why the answer is not "add a faster kernel" but "use more cores", if 15 GB/s is ever the
+constraint.
+
+**Eight lanes edge ahead only here** (2.49× against 2.36×), and only because more loads in
+flight partially hide memory latency — the same effect visible in the 16 MiB row of the lane
+table. It is a memory effect, not a pipeline one, and worth about 5%.
+
+For most callers none of this is the bottleneck: at ~15 GB/s the fold already outruns any
+single NVMe drive, so a CRC over a file read from disk is not what the program is waiting for.
+
 ### Going further
 
 Nothing here is the ceiling.
@@ -535,12 +706,18 @@ CRC directly, but it is hardwired to the Castagnoli polynomial, so it could acce
 `Crc32.Castagnoli` and nothing else. Given folding already reaches ~21 GB/s for *every*
 parameter set, a special case for one preset did not seem worth the branch.
 
-The `pshufb` on each load could be skipped in the reflected little-endian case, where the
-permutation is the identity. On this microarchitecture shuffles and carry-less multiplies
-compete for the same port, so it may be worth a little; it was left in for simplicity. Note
-that this case is more common than it first looks: `ComputeBytes` uses the little-endian
-permutation too, so every reflected preset — `IsoHdlc` and `Castagnoli` included — takes the
-identity shuffle when checksumming a byte buffer.
+**Skipping the identity `pshufb`** is the one clearly unclaimed win left, and it is no longer
+a guess. Where the permutation is the identity — the reflected engine reading bytes or
+little-endian words — the shuffle moves nothing, yet still costs a slot on the port it shares
+with the carry-less multiplies. Removing it measures **16–20% cache-resident** and **~9%
+streaming**, the gap between the two being the part that hides behind memory stalls. See
+[fold lanes](#fold-lanes) and [streaming](#streaming-versus-resident-data).
+
+This case is more common than it first looks: `ComputeBytes` takes the little-endian
+permutation too, so every reflected preset — `IsoHdlc` and `Castagnoli` included — is folding
+through an identity shuffle when checksumming a byte buffer. It is still in place for
+simplicity, since removing it means a second kernel or a branch in the inner loop, and the
+streaming figure is where the honest payoff lies.
 
 ## Project layout
 
@@ -553,7 +730,10 @@ CustomCrc32.slnx                  Solution (new-style XML format)
 ├── CustomCrc32.Test/             NUnit test suite
 │   └── Crc32Tests.cs
 └── CustomCrc32.Benchmarks/       BenchmarkDotNet console app
-    ├── Crc32Benchmarks.cs
+    ├── Crc32Benchmarks.cs        Fold against the bitwise and table formulations
+    ├── FoldLanes.cs              The fold kernel with the lane count made configurable
+    ├── FoldLaneBenchmarks.cs     One, two, four and eight lanes, cache-resident
+    ├── StreamingBenchmarks.cs    1 GiB cold, against a pure-read roofline
     ├── ThroughputColumn.cs
     └── Program.cs
 ```
