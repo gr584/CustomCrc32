@@ -8,8 +8,14 @@ including reflected variants, and twelve catalogued CRC-32s ship as named preset
 
 The word entry points are the unusual half: they let you checksum values you hold as `uint`
 without materialising a byte buffer, choosing the serialisation order explicitly rather than
-inheriting the host's. `ComputeBytes` covers the ordinary case — a file, a packet, a wire
-message — at any length.
+inheriting the host's. Verifying a checksum that was computed on a big-endian machine is what
+they exist for, and it is the one thing `System.IO.Hashing` cannot express: every input it
+accepts is a byte span, and its parameter set varies polynomial, initial value, final XOR and
+reflection — never byte order. From a little-endian host you have to serialise the words
+yourself first, which [takes 1.5× to 3.9× as long as folding them
+directly](#big-endian-words-from-a-little-endian-host), while the cast that would avoid the
+copy silently computes the little-endian CRC instead. `ComputeBytes` covers the ordinary case
+— a file, a packet, a wire message — at any length.
 
 Runs at **~21 GB/s** on x86-64 with carry-less multiply, for every parameter set rather than
 a privileged few, falling back to a table where the instructions are unavailable. That figure
@@ -239,7 +245,8 @@ block already goes through, so it costs nothing at all; in the table path it is 
 `bswap` on the incoming word rather than on the CRC register, so it carries no dependency on
 the previous iteration. Measured at every size and in both engines — see the benchmarks
 below. Never pre-swap the buffer with `BinaryPrimitives.ReverseEndianness`; that allocates
-and adds a pass.
+and adds a pass, and is [measured at 1.5–3.9× the
+cost](#big-endian-words-from-a-little-endian-host) of letting the fold absorb it.
 
 ### When the data is really bytes
 
@@ -594,7 +601,7 @@ stopped working would fail the suite rather than quietly weaken an oracle.
 
 ## Benchmarks
 
-[`CustomCrc32.Benchmarks`](CustomCrc32.Benchmarks/) holds five sets, each answering a
+[`CustomCrc32.Benchmarks`](CustomCrc32.Benchmarks/) holds six sets, each answering a
 different question:
 
 - **`Crc32Benchmarks`** — the fold against two slower formulations, one bit at a time and one
@@ -610,6 +617,10 @@ different question:
 - **`SystemIoHashingBenchmarks`** — the fold against `System.IO.Hashing` 11.0, which gained a
   configurable parameter set and so [covers the same ground](#against-systemiohashing) for the
   first time. Built for `net10.0` only, for the reason given there.
+- **`BigEndianWordBenchmarks`** — `ComputeBigEndian` against the three ways a `System.IO.Hashing`
+  caller can reach the same answer from a little-endian host, all of which
+  [have to swap the bytes first](#big-endian-words-from-a-little-endian-host). `net10.0` only,
+  for the same reason.
 
 Baselines that the library does not expose are reimplemented inside the benchmark — the table
 formulations in the first set, the other lane counts in `FoldLanes` — since the library folds
@@ -897,9 +908,12 @@ The honest summary for a caller: if you are on .NET 10 or newer, can take a pre-
 dependency, and want one of the CRCs `Crc32ParameterSet` can express, the BCL now does this at
 the same speed with nothing third-party involved. What is still here and not there is a
 `net8.0` target, a stable version, twelve named presets against two, `ReflectInput` and
-`ReflectOutput` as separate parameters, word-oriented entry points that take
-`ReadOnlySpan<uint>` with the byte order named at the call site, and an incremental API that
-threads a bare `uint` register rather than an object to allocate and reset.
+`ReflectOutput` as separate parameters, an incremental API that threads a bare `uint` register
+rather than an object to allocate and reset, and word-oriented entry points that take
+`ReadOnlySpan<uint>` with the byte order named at the call site — the last of which is not a
+convenience but [the one thing the package cannot do at
+all](#big-endian-words-from-a-little-endian-host), and the next section measures what working
+around it costs.
 
 <details>
 <summary>Why this one benchmark builds for <code>net10.0</code></summary>
@@ -920,6 +934,77 @@ this README stays reproducible on `net8.0`. The runtime change is not itself doi
 the figures: the fold's rows above sit within about 1% of the same measurements taken on
 .NET 8.0.30 in the previous section.
 </details>
+
+### Big-endian words from a little-endian host
+
+The section above compares the two over bytes, where they are level. This is the case where
+they are not comparable at all: you hold `uint` values and need the CRC of their **big-endian**
+serialisation — verifying, from an x86-64 box, a checksum that a big-endian machine computed.
+
+`System.IO.Hashing` has no way to say that. Every input it accepts is a `ReadOnlySpan<byte>`,
+a `byte[]` or a `Stream`; there is no word overload, and `Crc32ParameterSet` varies
+`Polynomial`, `InitialValue`, `FinalXorValue` and `ReflectValues` — none of which is byte
+order. `ReflectValues` reverses the bits *within* each byte and the register, never the order
+of the bytes themselves, so it does not stand in. Nor can the parameters be bent into
+compensating: across 2,000,000 sets tried against the host's own byte layout — a million
+varying initial value, final XOR and reflection over the ISO-HDLC polynomial, a million fully
+random — requiring agreement on two different word arrays at once, **zero** matched.
+
+So the caller has to produce the big-endian bytes. `BigEndianWordBenchmarks` measures the
+three ways to do that, ordered by how much memory each needs beyond the input, against
+`ComputeBigEndian` folding the same words directly. Same machine and job as the tables above,
+.NET 10.0.11, ISO-HDLC throughout. Throughput, higher is better:
+
+| Route                                        | 4 KiB (L1)     | 64 KiB (L2)    | 1 MiB (L3)     | 16 MiB (past L3) |
+| -------------------------------------------- | -------------- | -------------- | -------------- | ---------------- |
+| **`ComputeBigEndian`**                       | **20.30 GB/s** | **24.01 GB/s** | **22.92 GB/s** | 15.29 GB/s       |
+| Swap into a second buffer                    | 13.65 GB/s     | 13.74 GB/s     | 5.84 GB/s      | 6.36 GB/s        |
+| Swap through 8 KiB of scratch                | 12.25 GB/s     | 12.70 GB/s     | 14.31 GB/s     | 10.41 GB/s       |
+| Swap in place and back                       | 12.53 GB/s     | 12.10 GB/s     | 10.93 GB/s     | 5.55 GB/s        |
+| *No swap — computes the little-endian CRC*   | 21.89 GB/s     | 22.34 GB/s     | 22.46 GB/s     | **15.54 GB/s**   |
+
+**None of this is the package being slow.** The last row is the control: it hands
+`System.IO.Hashing` the words exactly as the host laid them out and hashes them, which takes
+0.93–1.08× the fold's time across the four sizes — the same dead heat the byte comparison
+found. It is also, of course, the wrong answer, being `ComputeLittleEndian` by another route.
+Everything between that row and the top one is the byte swap and nothing else.
+
+**The cheapest correct route costs between half and three-quarters of the checksum again.**
+Best case at each size is 1.49×, 1.75×, 1.60× and 1.47× the fold, and no route at any size
+gets under 1.47×. The swap is already `BinaryPrimitives.ReverseEndianness`'s vectorised span
+overload, so that is the floor rather than a strawman.
+
+**Past cache, the ranking is just how many times each route touches memory.** Counting
+buffer-sized traversals: streaming through scratch reads the input once and does the rest in
+L1; a second buffer reads, writes and reads again, three times the traffic; in place reads and
+writes to swap, reads to hash, then reads and writes to swap back, five times. At 16 MiB they
+finish at 10.41, 6.36 and 5.55 GB/s, against the control's 15.54 GB/s for a single traversal —
+the same order the traffic predicts, though compressed rather than proportional, since stores
+are cheaper than loads and overlap with the folding.
+
+**So the memory-frugal route is also the fast one at scale**, which inverts the usual
+trade-off. Fixed 8 KiB of scratch keeps the destination in L1 and leaves only the input to be
+fetched: 14.31 GB/s at 1 MiB and 10.41 GB/s at 16 MiB, 2.4× and 1.6× what a second buffer
+manages. It pays for that with per-chunk `Append` overhead, which is why it is the *slowest*
+of the three at 4 KiB, where nothing has to leave cache and traffic stops mattering.
+
+**The route that looks free is the expensive one.** Swapping in place needs no extra memory at
+all and is the worst of the three at 16 MiB, at five traversals to the others' three and one.
+It also demands a `uint[]` you own outright — it cannot take a `ReadOnlySpan`, cannot touch a
+shared or cached array, and leaves the caller's data byte-swapped for the duration, so nothing
+else may read it meanwhile.
+
+**The zero in the allocation column is the benchmark's framing, not a property of the
+approach.** `MemoryDiagnoser` reports zero bytes for all five rows, because the swap buffers
+and the `Crc32` instance are hoisted into `GlobalSetup` and reused across invocations. A
+caller that allocates its swap buffer per call adds a full-size allocation to every checksum.
+`ComputeBigEndian` has nothing to hoist: it reads the caller's `ReadOnlySpan<uint>` in place.
+
+The summary for a caller, then, is the reverse of the previous section's. Over bytes the two
+libraries are interchangeable on speed. Over words with a named byte order they are not
+comparable: this is the entry point the library was written for, and reaching the same answer
+through `System.IO.Hashing` means giving up somewhere between a third and three-quarters of
+your throughput, or mutating the caller's array, or both.
 
 ### Going further
 
@@ -968,6 +1053,7 @@ CustomCrc32.slnx                  Solution (new-style XML format)
     ├── Crc32cHardware.cs            CRC-32C via SSE4.2, one chain and three
     ├── Crc32cHardwareBenchmarks.cs  The fold against the dedicated CRC instruction
     ├── SystemIoHashingBenchmarks.cs The fold against System.IO.Hashing 11.0 (net10.0 only)
+    ├── BigEndianWordBenchmarks.cs   ComputeBigEndian against swap-then-hash (net10.0 only)
     ├── ThroughputColumn.cs
     └── Program.cs
 ```
