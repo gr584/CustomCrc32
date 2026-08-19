@@ -37,9 +37,14 @@ uint ofFile = Crc32.IsoHdlc.ComputeBytes(File.ReadAllBytes("payload.bin"));
 
 ## Requirements
 
-- .NET 8.0 or newer at runtime. The library and its tests target `net8.0`; the benchmark
-  project additionally builds for `net10.0`, for [one comparison](#against-systemiohashing)
-  whose dependency ships its accelerated code no lower.
+- .NET 8.0 or newer at runtime. The library multi-targets `net8.0` and `net10.0` from
+  identical source — there is no conditional compilation in it — so `net8.0` stays the
+  supported floor while a consumer on a current runtime gets an assembly built for that
+  runtime rather than one resolved down a compatibility step. The test suite multi-targets the
+  same pair and runs in full on each, which needs **both runtimes installed**: the `net8.0`
+  leg's test host will not roll forward to 10.0 on its own. The benchmark project is `net10.0`
+  only, because [one comparison](#against-systemiohashing) has a dependency that ships its
+  accelerated code no lower.
 - **Building through `CustomCrc32.slnx` needs a newer SDK than 8.0.** The `.slnx` solution
   format postdates the 8.0 CLI, which cannot parse it; CI installs the 10.0 SDK for exactly
   that reason, and development is on 10.0.303. With an older SDK, build the individual
@@ -466,8 +471,8 @@ polynomials, initial values and final XORs before the implementation was written
 
 ## Correctness
 
-The test suite ([`CustomCrc32.Test`](CustomCrc32.Test/Crc32Tests.cs), NUnit, 375 tests) is
-built on two independent oracles. The first is **Williams' model spelled out literally** — feed
+The test suite ([`CustomCrc32.Test`](CustomCrc32.Test/Crc32Tests.cs), NUnit, 375 tests, run
+on both target frameworks) is built on two independent oracles. The first is **Williams' model spelled out literally** — feed
 each byte in at the top of the register, clock it one bit at a time, reflect on the way in and
 out where asked. It is deliberately naive and structurally unlike the table-driven
 implementation, and its own bit reversals are loop-based rather than the library's
@@ -537,13 +542,19 @@ Ninety-eight of those tests check this library against `System.IO.Hashing` rathe
 the reference model. Its 11.0 pre-release takes a configurable parameter set, so for the first
 time there is a second implementation covering the same ground rather than one preset of it.
 
-It makes an unusually good oracle. It was written by other people, from the catalogue rather
-than from this code — and on this `net8.0` target it resolves the package's `netstandard2.0`
-asset, which carries no hardware intrinsics at all. So these tests hold a carry-less multiply
-fold against an implementation that does not fold. Where the machine lacks `PCLMULQDQ` or
-`SSSE3` they still pass, having compared two non-folding implementations instead, so every
-assertion message carries `Crc32.IsHardwareAccelerated` and a failure says which path was
-actually running.
+It makes an unusually good oracle, and multi-targeting the suite yields two of it. It was
+written by other people, from the catalogue rather than from this code, and NuGet resolves a
+different asset for each leg. On `net8.0` the package resolves its `netstandard2.0` asset,
+which carries no hardware intrinsics at all, so that leg holds a carry-less multiply fold
+against an implementation that does not fold. On `net10.0` it resolves the vectorised asset,
+so that leg holds two independent folds against each other. Every assertion below therefore
+runs twice against two genuinely different implementations, and neither comparison subsumes
+the other: the first says the fold agrees with something structurally unlike it, the second
+says two folds written from the same catalogue by different people agree.
+
+Where the machine lacks `PCLMULQDQ` or `SSSE3` they still pass, having compared two
+non-folding implementations instead, so every assertion message carries
+`Crc32.IsHardwareAccelerated` and a failure says which path was actually running.
 
 The second oracle is anchored exactly as the first is: the package, driven through a parameter
 set built from this library's, must reproduce all twelve published check values. Passing means
@@ -593,11 +604,12 @@ side surfaces as one clear failure rather than as noise across the cross-checks.
 </details>
 
 One caveat worth stating plainly: `System.IO.Hashing` 11.0 declares `net10.0` as its lowest
-supported target and warns when referenced from `net8.0`. The `netstandard2.0` asset that
-resolves instead is wanted here rather than merely tolerated, for the independence described
-above, so the warning is suppressed in the test project — but not taken on trust. The
-check-value anchor runs on that exact target framework, so an unsupported configuration that
-stopped working would fail the suite rather than quietly weaken an oracle.
+supported target and warns on the `net8.0` leg. The `netstandard2.0` asset that resolves
+instead is wanted here rather than merely tolerated, for the independence described above, so
+the warning is suppressed in the test project — but not taken on trust. The check-value anchor
+runs on each target framework separately, so an unsupported configuration that stopped working
+would fail the suite rather than quietly weaken an oracle. The `net10.0` leg is a supported
+configuration and raises nothing.
 
 ## Benchmarks
 
@@ -616,11 +628,11 @@ different question:
   where the library is at a structural disadvantage.
 - **`SystemIoHashingBenchmarks`** — the fold against `System.IO.Hashing` 11.0, which gained a
   configurable parameter set and so [covers the same ground](#against-systemiohashing) for the
-  first time. Built for `net10.0` only, for the reason given there.
+  first time. This is the set that decides the project's target framework, for the reason
+  given there.
 - **`BigEndianWordBenchmarks`** — `ComputeBigEndian` against the three ways a `System.IO.Hashing`
   caller can reach the same answer from a little-endian host, all of which
-  [have to swap the bytes first](#big-endian-words-from-a-little-endian-host). `net10.0` only,
-  for the same reason.
+  [have to swap the bytes first](#big-endian-words-from-a-little-endian-host).
 
 Baselines that the library does not expose are reimplemented inside the benchmark — the table
 formulations in the first set, the other lane counts in `FoldLanes` — since the library folds
@@ -637,23 +649,19 @@ no built-in throughput column, and `OperationsPerInvoke` cannot be used here bec
 requires a compile-time constant.
 
 ```
-dotnet run -c Release -f net8.0 --project CustomCrc32.Benchmarks
+dotnet run -c Release --project CustomCrc32.Benchmarks
 ```
 
-The project multi-targets, so `dotnet run` needs to be told which framework. Everything below
-was measured on `net8.0` except [the `System.IO.Hashing` comparison](#against-systemiohashing),
-which only exists in the `net10.0` build:
-
-```
-dotnet run -c Release -f net10.0 --project CustomCrc32.Benchmarks
-```
+This is the one project here that does not multi-target — it is `net10.0` alone, for
+[the reason below](#against-systemiohashing) — so there is no `-f` to pass and every set is
+measured against the same runtime.
 
 Extra arguments are forwarded to BenchmarkDotNet (`-- --job short`, `--filter`, …). Every
 class runs by default, which includes the streaming set — that one allocates **1 GiB** and
 takes several minutes, so narrow the run when you do not want it:
 
 ```
-dotnet run -c Release -f net8.0 --project CustomCrc32.Benchmarks -- --filter '*FoldLaneBenchmarks*'
+dotnet run -c Release --project CustomCrc32.Benchmarks -- --filter '*FoldLaneBenchmarks*'
 ```
 
 ### Indicative results
@@ -662,6 +670,16 @@ Intel Xeon E-2174G @ 3.80 GHz (4 physical / 8 logical cores), Windows 11 25H2, .
 X64 RyuJIT x86-64-v3, BenchmarkDotNet 0.15.8. **Taken with `--job short`** (3 warmup + 3
 iterations) — good enough for the headline ratios, but re-run with the default job before
 quoting these anywhere.
+
+**On the runtime these were taken on.** This table and every one down to
+[against the dedicated CRC instruction](#against-the-dedicated-crc-instruction) was measured
+on .NET 8.0.30, back when the benchmark project still built for `net8.0` as well; the command
+above now runs on .NET 10, so re-running reproduces the shape rather than the digits. They are
+left as measured, because the runtime is not what any of them is about and the difference is
+checked rather than assumed: the fold's rows in
+[the `System.IO.Hashing` comparison](#against-systemiohashing) were taken on .NET 10.0.11 on
+this same machine and land within about 1% of the corresponding rows in the dedicated-CRC
+table. A kernel that is `PCLMULQDQ` and `PSHUFB` in a loop leaves the JIT little to decide.
 
 Throughput, higher is better. *Table* is one lookup per byte — the same formulation the
 library still runs for short inputs, for the tail, and on machines without the instructions:
@@ -916,7 +934,7 @@ all](#big-endian-words-from-a-little-endian-host), and the next section measures
 around it costs.
 
 <details>
-<summary>Why this one benchmark builds for <code>net10.0</code></summary>
+<summary>Why the benchmark project targets <code>net10.0</code> and nothing lower</summary>
 
 The package ships its vectorised implementation in its `net10.0` and `net11.0` assets only. A
 `net8.0` consumer silently resolves the `netstandard2.0` asset instead, which contains no
@@ -927,12 +945,19 @@ quietly reports a different algorithm than the one you meant to measure. Timing 
 would have produced a flattering result for this library that said nothing about either
 implementation, only about which asset NuGet picked.
 
-Hence `<TargetFrameworks>net8.0;net10.0</TargetFrameworks>` on the benchmark project, the
-package referenced under `net10.0` alone, and `SystemIoHashingBenchmarks` behind
-`#if NET10_0_OR_GREATER` so a `net8.0` run cannot include it by accident. Everything else in
-this README stays reproducible on `net8.0`. The runtime change is not itself doing anything to
-the figures: the fold's rows above sit within about 1% of the same measurements taken on
-.NET 8.0.30 in the previous section.
+So this comparison needs `net10.0`, and the benchmark project is the one place in the
+repository that does *not* also build for `net8.0` — the library and the test suite both
+multi-target. Building the four sets that have no dependency on the package for `net8.0` too
+would have doubled every run to answer nothing, and left the two tables that need `net10.0`
+quoted against a different runtime from the other five. One target framework is one fewer
+thing to hold in your head while reading the numbers, and it costs nothing measurable: the
+fold's rows above sit within about 1% of the same measurements taken on .NET 8.0.30 in
+[the previous section](#against-the-dedicated-crc-instruction).
+
+`net8.0` still meets this package in one place — the test suite, where the `netstandard2.0`
+asset is [wanted rather than tolerated](#a-second-oracle), because a non-folding oracle is
+exactly what a folding implementation ought to be checked against. What is a hazard for a
+benchmark is the point of a test.
 </details>
 
 ### Big-endian words from a little-endian host
@@ -1011,8 +1036,12 @@ your throughput, or mutating the caller's array, or both.
 Nothing here is the ceiling.
 
 **VPCLMULQDQ** folds 256 or 512 bits per instruction instead of 128 and would multiply this
-again, but it needs Ice Lake or newer, and .NET 8 does not expose `Pclmulqdq.V256` at all —
-that arrived later. This machine is Coffee Lake, so it was not an option to measure.
+again, but it needs Ice Lake or newer, and this machine is Coffee Lake, so it was not an
+option to measure. Multi-targeting moved this one step closer without arriving: .NET 8 does
+not expose `Pclmulqdq.V256` at all, so until the `net10.0` leg existed the API was as far out
+of reach as the hardware. Now only the hardware is, and a wider kernel would have to sit
+behind `#if NET10_0_OR_GREATER` as well as a runtime `IsSupported` check, since the `net8.0`
+floor still has to compile.
 
 **`Sse42.Crc32`** is measured rather than assumed, and it is the one door that turns out to be
 closed. It computes a CRC in a single instruction, but is hardwired to the Castagnoli
@@ -1040,20 +1069,20 @@ streaming figure is where the honest payoff lies.
 ```
 CustomCrc32.slnx                  Solution (new-style XML format)
 ├── .github/workflows/ci.yml      Build and test on every push and pull request
-├── CustomCrc32/                  Class library — the implementation
+├── CustomCrc32/                  Class library — the implementation (net8.0, net10.0)
 │   ├── Crc32.cs                  Engines, folding, presets, streaming API
 │   └── Crc32Parameters.cs        Parameter model and preset values
-├── CustomCrc32.Test/             NUnit test suite
+├── CustomCrc32.Test/             NUnit test suite (net8.0, net10.0)
 │   └── Crc32Tests.cs
-└── CustomCrc32.Benchmarks/       BenchmarkDotNet console app
+└── CustomCrc32.Benchmarks/       BenchmarkDotNet console app (net10.0)
     ├── Crc32Benchmarks.cs           Fold against the bitwise and table formulations
     ├── FoldLanes.cs                 The fold kernel with the lane count made configurable
     ├── FoldLaneBenchmarks.cs        One, two, four and eight lanes, cache-resident
     ├── StreamingBenchmarks.cs       1 GiB cold, against a pure-read roofline
     ├── Crc32cHardware.cs            CRC-32C via SSE4.2, one chain and three
     ├── Crc32cHardwareBenchmarks.cs  The fold against the dedicated CRC instruction
-    ├── SystemIoHashingBenchmarks.cs The fold against System.IO.Hashing 11.0 (net10.0 only)
-    ├── BigEndianWordBenchmarks.cs   ComputeBigEndian against swap-then-hash (net10.0 only)
+    ├── SystemIoHashingBenchmarks.cs The fold against System.IO.Hashing 11.0
+    ├── BigEndianWordBenchmarks.cs   ComputeBigEndian against swap-then-hash
     ├── ThroughputColumn.cs
     └── Program.cs
 ```
@@ -1061,20 +1090,27 @@ CustomCrc32.slnx                  Solution (new-style XML format)
 Package versions: NUnit 4.6.1, NUnit3TestAdapter 6.2.0, Microsoft.NET.Test.Sdk 18.8.1,
 coverlet.collector 10.0.1, BenchmarkDotNet 0.15.8, System.IO.Hashing
 11.0.0-preview.7.26381.103 — the last in the test project, where it is
-[a second oracle](#a-second-oracle), and in the benchmarks' `net10.0` build, where it is
+[a second oracle](#a-second-oracle) on each target framework and a different implementation on
+each, and in the benchmarks, where it is
 [the thing being measured against](#against-systemiohashing).
 
 ## Commands
 
 ```bash
-dotnet build CustomCrc32.slnx                                       # build
-dotnet test  CustomCrc32.slnx                                       # run tests
-dotnet run -c Release -f net8.0 --project CustomCrc32.Benchmarks    # run benchmarks
+dotnet build CustomCrc32.slnx                              # build, both frameworks
+dotnet test  CustomCrc32.slnx                              # test, both frameworks
+dotnet test  CustomCrc32.slnx -f net8.0                    # test, one framework
+dotnet run -c Release --project CustomCrc32.Benchmarks     # run benchmarks
 ```
 
 The two solution-level commands need an SDK that understands `.slnx` — see
 [Requirements](#requirements). Point them at the individual `.csproj` files on an older one.
 
+The library and the test suite build and test for `net8.0` and `net10.0` both, so the two
+commands above do each twice — 375 tests per leg, against
+[a different second oracle](#a-second-oracle) each time. Running the `net8.0` leg needs the
+.NET 8 runtime present as well as the 10.0 SDK; `-f` narrows to one leg if it is not.
+
 Benchmarks must be run against a Release build; BenchmarkDotNet will refuse otherwise. The
-benchmark project multi-targets, so `dotnet run` needs `-f` — use `-f net10.0` for
-[the `System.IO.Hashing` comparison](#against-systemiohashing), `-f net8.0` for the rest.
+benchmark project targets `net10.0` alone, so `dotnet run` needs no `-f` —
+[why](#against-systemiohashing).

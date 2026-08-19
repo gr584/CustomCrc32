@@ -649,9 +649,14 @@ public class Crc32Tests
     // System.IO.Hashing 11.0 takes a configurable parameter set, so for the first time there
     // is a second implementation covering the same ground rather than one preset of it. It is
     // an unusually good oracle here: written by other people, from the catalogue rather than
-    // from this code, and — on this net8.0 target, which resolves the package's netstandard2.0
-    // asset — carrying no hardware intrinsics at all. So these tests hold a carry-less
-    // multiply fold against something that does not fold, which is the comparison worth having.
+    // from this code.
+    //
+    // This fixture multi-targets, and NuGet hands each leg a different asset, so these tests
+    // run twice against two genuinely different implementations. On net8.0 the package
+    // resolves netstandard2.0, which carries no hardware intrinsics at all, so that leg holds
+    // a carry-less multiply fold against something that does not fold. On net10.0 it resolves
+    // the vectorised asset, so that leg holds two independent folds against each other. Both
+    // comparisons are worth having and neither subsumes the other.
     //
     // Where the machine lacks PCLMULQDQ or SSSE3 they still pass, having compared two
     // non-folding implementations instead; the assertion messages carry

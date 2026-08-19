@@ -3,26 +3,24 @@
   <PropertyGroup>
     <OutputType>Exe</OutputType>
     <!--
-      net8.0 is the framework the library targets and the one every other benchmark here is
-      quoted against. net10.0 exists for the System.IO.Hashing comparison alone: that package
-      only ships its vectorised implementation in its net10.0 and net11.0 assets, and a net8.0
-      consumer silently resolves the netstandard2.0 asset, which has no intrinsics at all.
-      Measuring against that would compare target frameworks rather than implementations.
+      Single-targeted, unlike the library and the tests, which build for net8.0 as well. The
+      System.IO.Hashing comparison needs net10.0 - the package ships its vectorised
+      implementation no lower, and a net8.0 consumer silently resolves the netstandard2.0
+      asset, which has no intrinsics at all - and there is no value in running the rest twice.
+      One framework also means `dotnet run` needs no -f, and every table in the README is
+      quoted against the same runtime rather than two.
     -->
-    <TargetFrameworks>net8.0;net10.0</TargetFrameworks>
+    <TargetFramework>net10.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
   </PropertyGroup>
 
   <ItemGroup>
     <PackageReference Include="BenchmarkDotNet" Version="0.15.8" />
-  </ItemGroup>
-
-  <!--
-    Pre-release, because the configurable parameter set this compares against is new in 11.0
-    and has not shipped in a stable version yet.
-  -->
-  <ItemGroup Condition="'$(TargetFramework)' == 'net10.0'">
+    <!--
+      Pre-release, because the configurable parameter set this compares against is new in 11.0
+      and has not shipped in a stable version yet.
+    -->
     <PackageReference Include="System.IO.Hashing" Version="11.0.0-preview.7.26381.103" />
   </ItemGroup>
 

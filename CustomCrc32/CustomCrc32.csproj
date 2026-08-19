@@ -1,7 +1,14 @@
 ﻿<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <TargetFramework>net8.0</TargetFramework>
+    <!--
+      net8.0 is the floor the library supports and the one its API is written against; net10.0
+      is built alongside it so consumers on a current runtime get an assembly compiled for it
+      rather than one resolved down a compatibility step. The source is identical on both -
+      there is no conditional compilation here - so the two differ only in what the JIT and the
+      framework beneath them are free to do.
+    -->
+    <TargetFrameworks>net8.0;net10.0</TargetFrameworks>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
   </PropertyGroup>

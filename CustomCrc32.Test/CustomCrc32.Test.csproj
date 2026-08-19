@@ -1,7 +1,7 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <TargetFramework>net8.0</TargetFramework>
+    <TargetFrameworks>net8.0;net10.0</TargetFrameworks>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
 
@@ -9,13 +9,13 @@
     <IsTestProject>true</IsTestProject>
 
     <!--
-      System.IO.Hashing 11.0 declares net10.0 as its lowest supported target and warns when
-      referenced from net8.0, where NuGet resolves its netstandard2.0 asset instead. That asset
-      is wanted here rather than merely tolerated - see the package reference below - and it is
-      not taken on trust: Preset_SystemIoHashing_OverCheckString_ReturnsPublishedCheckValue
-      anchors it against the twelve published check values on this exact target framework, so
-      an unsupported configuration that stopped working would fail the suite rather than
-      quietly weaken an oracle.
+      System.IO.Hashing 11.0 declares net10.0 as its lowest supported target and warns on the
+      net8.0 leg, where NuGet resolves its netstandard2.0 asset instead. That asset is wanted
+      here rather than merely tolerated - see the package reference below - and it is not taken
+      on trust: Preset_SystemIoHashing_OverCheckString_ReturnsPublishedCheckValue anchors it
+      against the twelve published check values on each target framework separately, so an
+      unsupported configuration that stopped working would fail the suite rather than quietly
+      weaken an oracle. The net10.0 leg is a supported configuration and raises nothing.
     -->
     <SuppressTfmSupportBuildWarnings>true</SuppressTfmSupportBuildWarnings>
   </PropertyGroup>
@@ -29,10 +29,12 @@
     <PackageReference Include="NUnit" Version="4.6.1" />
     <!--
       A second oracle, independent of the reference model in the fixture. Pre-release because
-      the configurable parameter set it is used for is new in 11.0. Deliberately left to
-      resolve its netstandard2.0 asset on this net8.0 target: that build carries no hardware
-      intrinsics, so it checks this library's fold against an implementation that does not
-      fold. The net10.0 asset, which does, is exercised by the benchmark project instead.
+      the configurable parameter set it is used for is new in 11.0. Referenced from both legs
+      on purpose, because NuGet resolves a different asset for each and the two are worth
+      having: net8.0 gets netstandard2.0, which carries no hardware intrinsics, so that leg
+      checks this library's fold against an implementation that does not fold; net10.0 gets the
+      vectorised asset, so that leg checks two folds against each other. Same assertions, two
+      genuinely different oracles.
     -->
     <PackageReference Include="System.IO.Hashing" Version="11.0.0-preview.7.26381.103" />
     <PackageReference Include="NUnit.Analyzers" Version="4.14.0">

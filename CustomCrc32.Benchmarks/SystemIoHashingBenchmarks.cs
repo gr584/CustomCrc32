@@ -1,5 +1,3 @@
-#if NET10_0_OR_GREATER
-
 using BenchmarkDotNet.Attributes;
 using BenchmarkDotNet.Configs;
 using Crc32ParameterSet = System.IO.Hashing.Crc32ParameterSet;
@@ -33,7 +31,8 @@ namespace CustomCrc32.Benchmarks;
 /// special case for, which is where a general implementation has to show it is general.
 /// </para>
 /// <para>
-/// This class only exists in the net10.0 build. The package ships its vectorised
+/// This class is why the benchmark project targets net10.0 and nothing lower, while the
+/// library and the tests also build for net8.0. The package ships its vectorised
 /// implementation in the net10.0 and net11.0 assets alone; a net8.0 consumer resolves the
 /// netstandard2.0 asset, which carries no intrinsics, and timing against that would measure
 /// the target framework rather than the code.
@@ -179,5 +178,3 @@ public class SystemIoHashingBenchmarks
     [Benchmark(Description = "System.IO.Hashing, built parameter set")]
     public uint HashingAutosar() => HashingCrc32.HashToUInt32(_autosar, _data);
 }
-
-#endif

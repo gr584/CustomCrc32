@@ -40,8 +40,9 @@ jobs:
       - name: Set up .NET
         uses: actions/setup-dotnet@v5
         with:
-          # 10.0 to understand the .slnx solution format, 8.0 for the runtime the
-          # projects target and the test host runs on.
+          # Both are needed. 10.0 understands the .slnx solution format, builds the
+          # benchmark project and runs the net10.0 test leg; 8.0 supplies the runtime
+          # the net8.0 test leg's host needs, which will not roll forward on its own.
           dotnet-version: |
             8.0.x
             10.0.x

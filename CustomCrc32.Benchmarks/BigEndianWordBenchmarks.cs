@@ -1,5 +1,3 @@
-#if NET10_0_OR_GREATER
-
 using System.Buffers.Binary;
 using System.Runtime.InteropServices;
 using BenchmarkDotNet.Attributes;
@@ -154,5 +152,3 @@ public class BigEndianWordBenchmarks
     [Benchmark(Description = "System.IO.Hashing, no swap (computes the little-endian CRC)")]
     public uint HashingNoSwap() => HashingCrc32.HashToUInt32(MemoryMarshal.AsBytes<uint>(_words));
 }
-
-#endif
