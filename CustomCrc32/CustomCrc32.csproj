@@ -2,11 +2,14 @@
 
   <PropertyGroup>
     <!--
-      net8.0 is the floor the library supports and the one its API is written against; net10.0
-      is built alongside it so consumers on a current runtime get an assembly compiled for it
-      rather than one resolved down a compatibility step. The source is identical on both -
-      there is no conditional compilation here - so the two differ only in what the JIT and the
-      framework beneath them are free to do.
+      net8.0 is the floor the library supports and the one its API is written against. net10.0
+      is built alongside it as groundwork rather than for a gain today: the source is identical
+      on both - there is no conditional compilation here - so the two assemblies carry the same
+      IL, and the JIT belongs to the runtime, which means a net8.0 build running on .NET 10 is
+      compiled exactly as the net10.0 one is. Measured, the two are within 1% at every size.
+      What the second target buys is somewhere to put a wider kernel behind
+      #if NET10_0_OR_GREATER later, since Pclmulqdq.V256 is absent from the net8.0 reference
+      assemblies entirely - see "Going further" in the README.
     -->
     <TargetFrameworks>net8.0;net10.0</TargetFrameworks>
     <ImplicitUsings>enable</ImplicitUsings>

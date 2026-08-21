@@ -7,8 +7,9 @@
       System.IO.Hashing comparison needs net10.0 - the package ships its vectorised
       implementation no lower, and a net8.0 consumer silently resolves the netstandard2.0
       asset, which has no intrinsics at all - and there is no value in running the rest twice.
-      One framework also means `dotnet run` needs no -f, and every table in the README is
-      quoted against the same runtime rather than two.
+      One framework also means `dotnet run` needs no -f, and every future run is quoted
+      against one runtime. The tables already in the README are not: most were measured on
+      net8.0 before this change, which the README says where it presents them.
     -->
     <TargetFramework>net10.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>

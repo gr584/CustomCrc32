@@ -53,12 +53,16 @@ jobs:
       - name: Build
         run: dotnet build CustomCrc32.slnx --configuration Release --no-restore
 
+      # No LogFileName on the trx logger: the suite multi-targets, and a fixed name means
+      # the net10.0 leg overwrites the net8.0 one, leaving a single file that does not say
+      # which leg it came from. The bare logger suffixes each file with its target
+      # framework, so both legs' results survive to be uploaded.
       - name: Test
         run: >
           dotnet test CustomCrc32.slnx
           --configuration Release
           --no-build
-          --logger "trx;LogFileName=test-results.trx"
+          --logger trx
           --results-directory artifacts/test-results
 
       - name: Upload test results

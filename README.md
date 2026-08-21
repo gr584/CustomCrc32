@@ -38,13 +38,15 @@ uint ofFile = Crc32.IsoHdlc.ComputeBytes(File.ReadAllBytes("payload.bin"));
 ## Requirements
 
 - .NET 8.0 or newer at runtime. The library multi-targets `net8.0` and `net10.0` from
-  identical source — there is no conditional compilation in it — so `net8.0` stays the
-  supported floor while a consumer on a current runtime gets an assembly built for that
-  runtime rather than one resolved down a compatibility step. The test suite multi-targets the
-  same pair and runs in full on each, which needs **both runtimes installed**: the `net8.0`
-  leg's test host will not roll forward to 10.0 on its own. The benchmark project is `net10.0`
-  only, because [one comparison](#against-systemiohashing) has a dependency that ships its
-  accelerated code no lower.
+  identical source — there is no conditional compilation in it — so `net8.0` is the supported
+  floor and the `net10.0` build is groundwork rather than a speed-up: same IL, and the JIT
+  belongs to the runtime, so a `net8.0` assembly on .NET 10 is compiled just as the `net10.0`
+  one is. It exists so a wider kernel can go behind `#if NET10_0_OR_GREATER`
+  [later](#going-further). The test suite multi-targets the same pair and runs in full on
+  each, which needs **both runtimes installed**: the `net8.0` leg's test host will not roll
+  forward to 10.0 on its own. The benchmark project is `net10.0` only, because
+  [one comparison](#against-systemiohashing) has a dependency that ships its accelerated code
+  no lower.
 - **Building through `CustomCrc32.slnx` needs a newer SDK than 8.0.** The `.slnx` solution
   format postdates the 8.0 CLI, which cannot parse it; CI installs the 10.0 SDK for exactly
   that reason, and development is on 10.0.303. With an older SDK, build the individual
@@ -538,7 +540,7 @@ else**, which is exactly the gap those tests exist to close.
 
 ### A second oracle
 
-Ninety-eight of those tests check this library against `System.IO.Hashing` rather than against
+Ninety-seven of those tests check this library against `System.IO.Hashing` rather than against
 the reference model. Its 11.0 pre-release takes a configurable parameter set, so for the first
 time there is a second implementation covering the same ground rather than one preset of it.
 
@@ -671,15 +673,29 @@ X64 RyuJIT x86-64-v3, BenchmarkDotNet 0.15.8. **Taken with `--job short`** (3 wa
 iterations) — good enough for the headline ratios, but re-run with the default job before
 quoting these anywhere.
 
+**Read the ratios, not the absolute figures.** Re-running
+[the dedicated-CRC table](#against-the-dedicated-crc-instruction) on the same machine and the
+same `net8.0` build reproduced every ratio to within 0.02 — 1.72, 1.95, 1.87, 1.50 against the
+1.72, 1.97, 1.87, 1.50 quoted there — while the throughput column came out uniformly about 6%
+lower, the machine having been in a different clock or thermal state. The conclusions in this
+README all rest on ratios and reproduce; the GB/s are indicative, which is what this section
+is called.
+
+**`--job short` is fine for a ratio and unreliable for a digit.** In the same exercise,
+one three-iteration run of the 1 MiB fold above read 13.17 GB/s where the default job puts it
+at 21.41, a 38% error, which is larger than any gap this README draws a conclusion from. Treat
+a short-job number that surprises you as unmeasured until the default job confirms it.
+
 **On the runtime these were taken on.** This table and every one down to
 [against the dedicated CRC instruction](#against-the-dedicated-crc-instruction) was measured
 on .NET 8.0.30, back when the benchmark project still built for `net8.0` as well; the command
 above now runs on .NET 10, so re-running reproduces the shape rather than the digits. They are
 left as measured, because the runtime is not what any of them is about and the difference is
-checked rather than assumed: the fold's rows in
-[the `System.IO.Hashing` comparison](#against-systemiohashing) were taken on .NET 10.0.11 on
-this same machine and land within about 1% of the corresponding rows in the dedicated-CRC
-table. A kernel that is `PCLMULQDQ` and `PSHUFB` in a loop leaves the JIT little to decide.
+checked rather than assumed. Running the dedicated-CRC class on both target frameworks on one
+machine, default job, changing nothing else puts the fold at 19.98 / 22.31 / 21.29 / 14.05
+GB/s on `net8.0` and 19.78 / 22.16 / 21.41 / 14.09 on `net10.0` — within 1% at every size, in
+both directions. A kernel that is `PCLMULQDQ` and `PSHUFB` in a loop leaves the JIT little to
+decide.
 
 Throughput, higher is better. *Table* is one lookup per byte — the same formulation the
 library still runs for short inputs, for the tail, and on machines without the instructions:
